@@ -24,6 +24,7 @@ int main(int argc, char *argv[])
   const std::string data_graph_name(argv[1]);
   const std::string pattern_name(argv[2]);
   size_t nthreads = argc < 4 ? 1 : std::stoi(argv[3]);
+  bool is_master = argc > 4;
 
   std::vector<Peregrine::SmallGraph> patterns;
   if (auto end = pattern_name.rfind("motifs"); end != std::string::npos)
@@ -46,12 +47,12 @@ int main(int argc, char *argv[])
   std::vector<std::pair<Peregrine::SmallGraph, uint64_t>> result;
   if (is_directory(data_graph_name))
   {
-    result = Peregrine::count(data_graph_name, patterns, nthreads);
+    result = Peregrine::count_parallel(data_graph_name, patterns, nthreads, is_master, 4);
   }
   else
   {
     Peregrine::SmallGraph G(data_graph_name);
-    result = Peregrine::count(G, patterns, nthreads);
+    result = Peregrine::count_parallel(G, patterns, nthreads, is_master, 4);
   }
 
   for (const auto &[p, v] : result)

@@ -12,6 +12,7 @@
 #include "Graph.hh"
 #include "PatternGenerator.hh"
 #include "PatternMatching.hh"
+#include "zmq/zmq.hpp"
 
 #define CALL_COUNT_LOOP(L, has_anti_vertices)\
 {\
@@ -902,6 +903,169 @@ namespace Peregrine
 
   template <typename DataGraphT>
   std::vector<std::pair<SmallGraph, uint64_t>>
+  count_parallel(DataGraphT &&data_graph, const std::vector<SmallGraph> &patterns, size_t nthreads, bool is_master, size_t nworkers)
+  {
+    // initialize
+    std::vector<std::pair<SmallGraph, uint64_t>> results;
+    if (patterns.empty()) return results;
+
+    // optimize if all unlabelled vertex-induced patterns of a certain size
+    // TODO: if a subset is all unlabelled vertex-induced patterns of a certain
+    // size it can be optimized too
+    uint32_t sz = patterns.front().num_vertices();
+    auto is_same_size = [&sz](const SmallGraph &p) {
+        return p.num_vertices() == sz && p.num_anti_vertices() == 0;
+      };
+    auto is_vinduced = [](const SmallGraph &p) {
+        uint32_t m = p.num_anti_edges() + p.num_true_edges();
+        uint32_t n = p.num_vertices();
+        return m == (n*(n-1))/2;
+      };
+    uint32_t num_possible_topologies[] = {
+      0,
+      1,
+      1,
+      2, // size 3
+      6, // size 4
+      21, // size 5
+      112, // size 6
+      853, // size 7
+      11117, // size 8
+      261080, // size 9
+    };
+
+    bool must_convert_counts = false;
+    std::vector<SmallGraph> new_patterns;
+    if (std::all_of(patterns.cbegin(), patterns.cend(), is_same_size)
+        && std::all_of(patterns.cbegin(), patterns.cend(), is_vinduced)
+        && (sz < 10 && patterns.size() == num_possible_topologies[sz]))
+    {
+      must_convert_counts = true;
+      new_patterns = PatternGenerator::all(sz, PatternGenerator::VERTEX_BASED, PatternGenerator::EXCLUDE_ANTI_EDGES);
+    }
+    else
+    {
+      new_patterns.assign(patterns.cbegin(), patterns.cend());
+    }
+
+    Barrier barrier(nthreads);
+    std::vector<std::thread> pool;
+    DataGraph dg(data_graph);
+    dg.set_rbi(new_patterns.front());
+
+    utils::Log{} << "Finished reading datagraph: |V| = " << dg.get_vertex_count()
+              << " |E| = " << dg.get_edge_count()
+              << "\n";
+
+    dg.set_known_labels(new_patterns);
+
+    zmq::context_t ctx;
+    zmq::socket_t master_push_sock(ctx, zmq::socket_type::push);
+    zmq::socket_t master_pull_sock(ctx, zmq::socket_type::pull);
+    if (is_master) {
+      std::cout << "running master" << std::endl;
+      master_push_sock.bind("tcp://*:9999");
+      master_pull_sock.bind("tcp://*:9998");
+    }
+
+    zmq::socket_t worker_pull_sock(ctx, zmq::socket_type::pull);
+    zmq::socket_t worker_push_sock(ctx, zmq::socket_type::push);
+    worker_pull_sock.connect("tcp://127.0.0.1:9999");
+    worker_push_sock.connect("tcp://127.0.0.1:9998");
+
+    worker_push_sock.send(zmq::str_buffer("ready"), zmq::send_flags::none);
+
+    if (is_master) {
+      void *pull_buf = malloc(1024);
+      zmq::mutable_buffer pull_mut_buf(pull_buf, 1024);
+      uint32_t num_workers_ready = 0;
+      while (num_workers_ready < nworkers) {
+        std::cout << "waiting for workers to connect..." << std::endl;
+        auto res = master_pull_sock.recv(pull_mut_buf, zmq::recv_flags::none);
+        if (res.has_value()) {
+          num_workers_ready++;
+        }
+      }
+
+      // send tasks now that workers are ready
+      for (int i = 0; i < 100; i++) {
+        master_push_sock.send(zmq::str_buffer("Hello world"), zmq::send_flags::none);
+      }
+      std::cout << "done sending" << std::endl;
+    }
+
+
+    // if master
+    // for each pattern
+    //  split pattern into tasks
+    //  push task to zmq socket
+
+    for (uint8_t i = 0; i < nthreads; ++i)
+    {
+      pool.emplace_back(count_worker,
+          i,
+          &dg,
+          std::ref(barrier));
+    }
+
+    // make sure the threads are all running
+    barrier.join();
+
+    auto t1 = utils::get_timestamp();
+    void *buf = malloc(1024);
+    zmq::mutable_buffer my_buf(buf, 1024);
+    while (worker_pull_sock.recv(my_buf, zmq::recv_flags::none).has_value()) {
+      std::cout << "received something" << std::endl; 
+    }
+    //
+    // while task.get
+    //    set gcount
+    //    set task_ctr, task_end, pattern
+    //    barrier.release();
+    //    barrier.join();
+    //    output task complete and gcount
+    //
+    for (const auto &p : new_patterns)
+    {
+      // reset state
+      Context::task_ctr = 0;
+      Context::gcount = 0;
+
+      // set new pattern
+      dg.set_rbi(p);
+
+      // begin matching
+      barrier.release();
+
+      // sleep until matching finished
+      barrier.join();
+
+      // get counts
+      uint64_t global_count = Context::gcount;
+      results.emplace_back(p, global_count);
+    }
+    auto t2 = utils::get_timestamp();
+
+    barrier.finish();
+    for (auto &th : pool)
+    {
+      th.join();
+    }
+
+    if (must_convert_counts)
+    {
+      results = convert_counts(results, patterns);
+    }
+
+    utils::Log{} << "-------" << "\n";
+    utils::Log{} << "all patterns finished after " << (t2-t1)/1e6 << "s" << "\n";
+
+
+    return results;
+  }
+
+  template <typename DataGraphT>
+  std::vector<std::pair<SmallGraph, uint64_t>>
   count(DataGraphT &&data_graph, const std::vector<SmallGraph> &patterns, size_t nworkers)
   {
     // initialize
@@ -950,6 +1114,7 @@ namespace Peregrine
     Barrier barrier(nworkers);
     std::vector<std::thread> pool;
     DataGraph dg(data_graph);
+
     dg.set_rbi(new_patterns.front());
 
     utils::Log{} << "Finished reading datagraph: |V| = " << dg.get_vertex_count()
