@@ -4,8 +4,9 @@
 #define MESSAGETYPES_HH
 
 struct Task {
-  uint32_t start_task;
-  uint32_t end_task;
+  uint64_t task_id;
+  uint64_t start_task;
+  uint64_t end_task;
   uint32_t pattern_idx;
 };
 
