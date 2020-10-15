@@ -3,6 +3,12 @@
 #ifndef MESSAGETYPES_HH
 #define MESSAGETYPES_HH
 
+enum MessageType : uint32_t {
+  Task = 0,
+  CompletedTask,
+  JobDone,
+};
+
 struct Task {
   uint64_t task_id;
   uint64_t start_task;
@@ -10,10 +16,17 @@ struct Task {
   uint32_t pattern_idx;
 };
 
+struct CompletedTask {
+  uint64_t task_id;
+  uint32_t pattern_idx;
+  uint64_t count;
+};
+
 struct PeregrineMessage {
-  int msg_type;
+  MessageType msg_type;
   union {
     struct Task task;
+    struct CompletedTask completed_task;
   } msg;
 };
 
