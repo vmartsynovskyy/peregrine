@@ -9,6 +9,7 @@
 #include <memory>
 #include <algorithm>
 #include <bitset>
+#include <cstdlib>
 
 #include "Options.hh"
 #include "Graph.hh"
@@ -16,6 +17,25 @@
 #include "PatternMatching.hh"
 #include "MessageTypes.hh"
 #include "zmq/zmq.hpp"
+
+#define CALL_COUNT_LOOP_PARALLEL(L, has_anti_vertices)\
+{\
+  switch (L)\
+  {\
+    case Graph::LABELLED:\
+      lcount += count_loop_parallel<Graph::LABELLED, has_anti_vertices>(dg, cands);\
+      break;\
+    case Graph::UNLABELLED:\
+      lcount += count_loop_parallel<Graph::UNLABELLED, has_anti_vertices>(dg, cands);\
+      break;\
+    case Graph::PARTIALLY_LABELLED:\
+      lcount += count_loop_parallel<Graph::PARTIALLY_LABELLED, has_anti_vertices>(dg, cands);\
+      break;\
+    case Graph::DISCOVER_LABELS:\
+      lcount += count_loop_parallel<Graph::DISCOVER_LABELS, has_anti_vertices>(dg, cands);\
+      break;\
+  }\
+}
 
 #define CALL_COUNT_LOOP(L, has_anti_vertices)\
 {\
@@ -139,6 +159,25 @@ namespace Peregrine
   }
 
   template <Graph::Labelling L, bool has_anti_vertices>
+  inline uint64_t count_loop_parallel(DataGraph *dg, std::vector<std::vector<uint32_t>> &cands)
+  {
+    uint32_t vgs_count = dg->get_vgs_count();
+
+    uint64_t lcount = 0;
+
+    uint64_t task = 0;
+    while ((task = Context::task_ctr.fetch_add(1, std::memory_order_relaxed) + 1) <= Context::task_end)
+    {
+      uint32_t v = (task-1) / vgs_count + 1;
+      uint32_t vgsi = task % vgs_count;
+      Counter<has_anti_vertices> m(dg->rbi, dg, vgsi, cands);
+      lcount += m.template map_into<L>(v);
+    }
+
+    return lcount;
+  }
+
+  template <Graph::Labelling L, bool has_anti_vertices>
   inline uint64_t count_loop(DataGraph *dg, std::vector<std::vector<uint32_t>> &cands)
   {
     uint32_t vgs_count = dg->get_vgs_count();
@@ -148,7 +187,7 @@ namespace Peregrine
     uint64_t lcount = 0;
 
     uint64_t task = 0;
-    while ((task = Context::task_ctr.fetch_add(1, std::memory_order_relaxed) + 1) <= Context::task_end)
+    while ((task = Context::task_ctr.fetch_add(1, std::memory_order_relaxed) + 1) <= num_tasks)
     {
       uint32_t v = (task-1) / vgs_count + 1;
       uint32_t vgsi = task % vgs_count;
@@ -177,18 +216,18 @@ namespace Peregrine
     zmq::socket_t master_push_sock(ctx, zmq::socket_type::push);
     zmq::socket_t master_pull_sock(ctx, zmq::socket_type::pull);
 
-    std::cout << "running master" << std::endl;
+    utils::Log{} << "---- MASTER ----\n";
     master_push_sock.bind("tcp://*:9999");
     master_pull_sock.bind("tcp://*:9998");
 
-    void *pull_buf = malloc(1024);
-    zmq::mutable_buffer pull_mut_buf(pull_buf, 1024);
+    zmq::message_t ready_msg;
     uint32_t num_workers_ready = 0;
+    utils::Log{} << "Waiting for all workers to become ready...\n";
     while (num_workers_ready < nworkers) {
-      std::cout << "waiting for workers to connect..." << std::endl;
-      auto res = master_pull_sock.recv(pull_mut_buf, zmq::recv_flags::none);
-      if (res.has_value()) {
+      auto res = master_pull_sock.recv(ready_msg, zmq::recv_flags::none);
+      if (res.has_value() && strcmp((char*) ready_msg.data(), "ready")) {
         num_workers_ready++;
+        utils::Log{} << "[" << num_workers_ready << "/" << nworkers << "] workers are ready" << "\n";
       }
     }
 
@@ -204,8 +243,6 @@ namespace Peregrine
 
       uint64_t task_item_start = 0;
       uint64_t task_item_end  = num_tasks_per_item;
-      std::cout << "items per task: " << num_tasks_per_item << std::endl;
-      std::cout << "num tasks: " << num_tasks << std::endl;
       while (task_item_start < num_tasks) {
         // construct a task message
         struct Task task = {
@@ -222,24 +259,24 @@ namespace Peregrine
 
         // send task message with zmq
         zmq::message_t zmq_msg(&message, sizeof(message));
-        master_push_sock.send(zmq_msg, zmq::send_flags::dontwait);
+        master_push_sock.send(zmq_msg, zmq::send_flags::none);
         tasks_sent++;
 
         task_item_start += num_tasks_per_item;
         task_item_end += num_tasks_per_item;
       }
     }
-    std::cout << "done sending " << tasks_sent << std::endl;
+
+    utils::Log{} << "master done sending tasks\n";
+
     zmq::message_t task_complete_msg;
     while (tasks_completed < tasks_sent && master_pull_sock.recv(task_complete_msg, zmq::recv_flags::none).has_value()) {
       struct PeregrineMessage *task_complete_pg_msg = static_cast<struct PeregrineMessage *>(task_complete_msg.data());
-      std::cout << "completed message type: " << task_complete_pg_msg->msg_type << std::endl;
-      std::cout << "completed message count: " << task_complete_pg_msg->msg.completed_task.count << std::endl;
-      std::cout << "completed message pattern: " << task_complete_pg_msg->msg.completed_task.pattern_idx << std::endl;
       results_map[task_complete_pg_msg->msg.completed_task.pattern_idx] += task_complete_pg_msg->msg.completed_task.count;
 
       tasks_completed++;
     }
+    utils::Log{} << "master done receiving tasks\n";
 
     for (size_t i = 0; i < new_patterns.size(); i++) {
       results.emplace_back(new_patterns[i], results_map[i]);
@@ -256,15 +293,63 @@ namespace Peregrine
       .msg_type = MessageType::JobDone,
       .msg = {},
     };
-    for (uint32_t i = 0; i < nworkers; i++) {
+    utils::Log{} << "telling workers job is done\n";
+    uint32_t workers_done = 0;
+    while (workers_done < nworkers) {
       zmq::message_t zmq_job_done_msg(&job_done_pg_msg, sizeof(job_done_pg_msg));
       master_push_sock.send(zmq_job_done_msg, zmq::send_flags::none);
+      if (master_pull_sock.recv(zmq_job_done_msg, zmq::recv_flags::dontwait).has_value()) {
+        workers_done++;
+      }
     }
 
     utils::Log{} << "-------" << "\n";
-    utils::Log{} << "all patterns finished after " << (t2-t1)/1e6 << "s" << "\n";
+    utils::Log{} << "master all patterns finished after " << (t2-t1)/1e6 << "s" << "\n";
 
+    // TODO: figure out why join on this function sometimes hangs even though the above line is printed
     return;
+  }
+
+  void count_worker_parallel(unsigned tid, DataGraph *dg, Barrier &b)
+  {
+    (void)tid; // unused
+
+    // an extra pre-allocated cand vector for scratch space, and one for anti-vertex
+    std::vector<std::vector<uint32_t>> cands(dg->rbi.query_graph.num_vertices() + 2);
+
+    while (b.hit())
+    {
+      Graph::Labelling L = dg->rbi.labelling_type();
+      bool has_anti_edges = dg->rbi.has_anti_edges();
+      bool has_anti_vertices = !dg->rbi.anti_vertices.empty();
+
+      cands.resize(dg->rbi.query_graph.num_vertices()+2);
+      for (auto &cand : cands) {
+        cand.clear();
+        cand.reserve(10000);
+      }
+
+      uint64_t lcount = 0;
+
+      if (has_anti_edges)
+      {
+        utils::Log{} << "anti edges not supported\n";
+        exit(1);
+      }
+      else
+      {
+        if (has_anti_vertices)
+        {
+          CALL_COUNT_LOOP_PARALLEL(L, true);
+        }
+        else
+        {
+          CALL_COUNT_LOOP_PARALLEL(L, false);
+        }
+      }
+
+      Context::gcount += lcount;
+    }
   }
 
   void count_worker(unsigned tid, DataGraph *dg, Barrier &b)
@@ -1097,15 +1182,15 @@ namespace Peregrine
     worker_pull_sock.connect("tcp://127.0.0.1:9999");
     worker_push_sock.connect("tcp://127.0.0.1:9998");
 
-    worker_push_sock.send(zmq::str_buffer("ready"), zmq::send_flags::none);
-
     if (is_master) {
       master = std::thread(count_master, &dg, std::ref(patterns), std::ref(new_patterns), nworkers, must_convert_counts, std::ref(results)); 
     }
 
+    worker_push_sock.send(zmq::str_buffer("ready"), zmq::send_flags::none);
+
     for (uint8_t i = 0; i < nthreads; ++i)
     {
-      pool.emplace_back(count_worker,
+      pool.emplace_back(count_worker_parallel,
           i,
           &dg,
           std::ref(barrier));
@@ -1116,13 +1201,12 @@ namespace Peregrine
 
     auto t1 = utils::get_timestamp();
     zmq::message_t task_msg;
+    uint64_t worker_tasks_completed = 0;
     while (worker_pull_sock.recv(task_msg, zmq::recv_flags::none).has_value()) {
       struct PeregrineMessage *task_pg_msg = static_cast<struct PeregrineMessage *>(task_msg.data());
-      /* std::cout << "type: " << task_pg_msg->msg_type << std::endl; 
-      std::cout << "task start: " << task_pg_msg->msg.task.start_task << std::endl; 
-      std::cout << "task end: " << task_pg_msg->msg.task.end_task << std::endl; 
-      std::cout << "pattern idx: " << task_pg_msg->msg.task.pattern_idx << std::endl; */
       if (task_pg_msg->msg_type == MessageType::JobDone) {
+        std::cout << "received done msg\n";
+        worker_push_sock.send(task_msg, zmq::send_flags::none);
         break;
       }
 
@@ -1137,20 +1221,23 @@ namespace Peregrine
 
       barrier.join();
 
-      // get counts
       uint64_t global_count = Context::gcount;
-      std::cout << "gcount: " << global_count << std::endl;
 
       send_task_complete_msg(std::ref(worker_push_sock), &task_pg_msg->msg.task, global_count);
+      worker_tasks_completed++;
     }
-    std::cout << "done pulling tasks" << std::endl; 
+    utils::Log{} << "worker is done all tasks in queue after completing " << worker_tasks_completed << " tasks\n";
 
     if (is_master) {
+      utils::Log{} << "master is joining\n";
       master.join();
+      utils::Log{} << "master is done joining\n";
     }
     auto t2 = utils::get_timestamp();
 
+    std::cout << "before barrier" << std::endl;
     barrier.finish();
+    std::cout << "after barrier" << std::endl;
     for (auto &th : pool)
     {
       th.join();
@@ -1238,6 +1325,7 @@ namespace Peregrine
       // reset state
       Context::task_ctr = 0;
       Context::gcount = 0;
+      Context::task_end = dg.get_vgs_count() * dg.get_vertex_count();
 
       // set new pattern
       dg.set_rbi(p);

@@ -1,0 +1,8 @@
+Finished reading datagraph: |V| = 3264 |E| = 4536
+---- MASTER ----
+Waiting for all workers to become ready...
+[1/4] workers are ready
+[2/4] workers are ready
+[3/4] workers are ready
+[4/4] workers are ready
+master done sending tasks
