@@ -17,14 +17,17 @@ int main(int argc, char *argv[])
 {
   if (argc < 3)
   {
-    std::cerr << "USAGE: " << argv[0] << " <data graph> <pattern | #-motifs | #-clique> [# threads]" << std::endl;
+    std::cerr << "USAGE: " << argv[0] << " <data graph> <pattern | #-motifs | #-clique> <# threads> <master|hostname-of-master for workers> [# workers]" << std::endl;
     return -1;
   }
 
   const std::string data_graph_name(argv[1]);
   const std::string pattern_name(argv[2]);
-  size_t nthreads = argc < 4 ? 1 : std::stoi(argv[3]);
-  bool is_master = argc > 4;
+  size_t nthreads = std::stoi(argv[3]);
+  bool is_parallel = argc > 4;
+  bool is_master = is_parallel ? std::string(argv[4]) == "master" : false;
+  std::string master_host = !is_master && argc > 4 ? std::string(argv[4]) : "127.0.0.1";
+  size_t num_workers = argc > 5 ? std::stoi(argv[5]) : 1;
 
   std::vector<Peregrine::SmallGraph> patterns;
   if (auto end = pattern_name.rfind("motifs"); end != std::string::npos)
@@ -47,12 +50,20 @@ int main(int argc, char *argv[])
   std::vector<std::pair<Peregrine::SmallGraph, uint64_t>> result;
   if (is_directory(data_graph_name))
   {
-    result = Peregrine::count_parallel(data_graph_name, patterns, nthreads, is_master, 4);
+    if (is_parallel) {
+      result = Peregrine::count_parallel(data_graph_name, patterns, nthreads, is_master, num_workers, master_host);
+    } else {
+      result = Peregrine::count(data_graph_name, patterns, nthreads);
+    }
   }
   else
   {
     Peregrine::SmallGraph G(data_graph_name);
-    result = Peregrine::count_parallel(G, patterns, nthreads, is_master, 4);
+    if (is_parallel) {
+      result = Peregrine::count_parallel(G, patterns, nthreads, is_master, num_workers, master_host);
+    } else {
+      result = Peregrine::count(G, patterns, nthreads);
+    }
   }
 
   for (const auto &[p, v] : result)

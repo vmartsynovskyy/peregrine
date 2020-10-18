@@ -236,19 +236,19 @@ namespace Peregrine
     uint64_t tasks_sent = 0;
     uint64_t tasks_completed = 0;
     for (uint32_t i = 0; i < (uint32_t) new_patterns.size(); i++) {
-      uint32_t vgs_count = dg->get_vgs_count();
+      AnalyzedPattern ap(new_patterns[i]);
+      uint32_t vgs_count = ap.vgs.size();
       uint32_t num_vertices = dg->get_vertex_count();
       uint64_t num_tasks = vgs_count * num_vertices;
       uint64_t num_tasks_per_item = (num_tasks / nworkers) / 8;
 
       uint64_t task_item_start = 0;
-      uint64_t task_item_end  = num_tasks_per_item;
       while (task_item_start < num_tasks) {
         // construct a task message
         struct Task task = {
           .task_id        = tasks_sent,
           .start_task     = task_item_start,
-          .end_task       = std::min(task_item_end, num_tasks),
+          .end_task       = std::min(task_item_start + num_tasks_per_item, num_tasks + 1),
           .pattern_idx    = i,
         };
         struct PeregrineMessage message = {
@@ -263,7 +263,6 @@ namespace Peregrine
         tasks_sent++;
 
         task_item_start += num_tasks_per_item;
-        task_item_end += num_tasks_per_item;
       }
     }
 
@@ -1118,7 +1117,7 @@ namespace Peregrine
 
   template <typename DataGraphT>
   std::vector<std::pair<SmallGraph, uint64_t>>
-  count_parallel(DataGraphT &&data_graph, const std::vector<SmallGraph> &patterns, size_t nthreads, bool is_master, size_t nworkers)
+  count_parallel(DataGraphT &&data_graph, const std::vector<SmallGraph> &patterns, size_t nthreads, bool is_master, size_t nworkers, std::string master_host)
   {
     // initialize
     std::vector<std::pair<SmallGraph, uint64_t>> results;
@@ -1179,8 +1178,14 @@ namespace Peregrine
 
     zmq::socket_t worker_pull_sock(ctx, zmq::socket_type::pull);
     zmq::socket_t worker_push_sock(ctx, zmq::socket_type::push);
-    worker_pull_sock.connect("tcp://127.0.0.1:9999");
-    worker_push_sock.connect("tcp://127.0.0.1:9998");
+
+    char hostname_buf[HOST_NAME_MAX + 11];
+
+    std::snprintf(hostname_buf, HOST_NAME_MAX + 11, "tcp://%s:9999", master_host.c_str());
+    worker_pull_sock.connect(hostname_buf);
+
+    std::snprintf(hostname_buf, HOST_NAME_MAX + 11, "tcp://%s:9998", master_host.c_str());
+    worker_push_sock.connect(hostname_buf);
 
     if (is_master) {
       master = std::thread(count_master, &dg, std::ref(patterns), std::ref(new_patterns), nworkers, must_convert_counts, std::ref(results)); 
@@ -1205,7 +1210,6 @@ namespace Peregrine
     while (worker_pull_sock.recv(task_msg, zmq::recv_flags::none).has_value()) {
       struct PeregrineMessage *task_pg_msg = static_cast<struct PeregrineMessage *>(task_msg.data());
       if (task_pg_msg->msg_type == MessageType::JobDone) {
-        std::cout << "received done msg\n";
         worker_push_sock.send(task_msg, zmq::send_flags::none);
         break;
       }
@@ -1235,9 +1239,7 @@ namespace Peregrine
     }
     auto t2 = utils::get_timestamp();
 
-    std::cout << "before barrier" << std::endl;
     barrier.finish();
-    std::cout << "after barrier" << std::endl;
     for (auto &th : pool)
     {
       th.join();

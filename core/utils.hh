@@ -8,6 +8,9 @@
 #include <sys/types.h>
 #include <set>
 #include <algorithm>
+#include <memory>
+#include <string>
+#include <stdexcept>
 
 #include <sys/time.h>
 #include <mutex>
@@ -93,6 +96,18 @@ template <typename T>
 bool bsearch(const std::vector<T> &vlist, T key) {
   return std::binary_search(vlist.begin(), vlist.end(), key);
 }
+
+// https://stackoverflow.com/a/26221725
+template<typename ... Args>
+std::string string_format( const std::string& format, Args ... args )
+{
+  size_t size = snprintf( nullptr, 0, format.c_str(), args ... ) + 1; // Extra space for '\0'
+  if( size <= 0 ){ throw std::runtime_error( "Error during formatting." ); }
+  std::unique_ptr<char[]> buf( new char[ size ] ); 
+  snprintf( buf.get(), size, format.c_str(), args ... );
+  return std::string( buf.get(), buf.get() + size - 1 ); // We don't want the '\0' inside
+}
+
 
 } // namespace utils
 
