@@ -215,6 +215,7 @@ namespace Peregrine
     zmq::context_t ctx;
     zmq::socket_t master_push_sock(ctx, zmq::socket_type::push);
     zmq::socket_t master_pull_sock(ctx, zmq::socket_type::pull);
+    master_push_sock.set(zmq::sockopt::sndhwm, 1);
 
     utils::Log{} << "---- MASTER ----\n";
     master_push_sock.bind("tcp://*:9999");
@@ -240,7 +241,7 @@ namespace Peregrine
       uint32_t vgs_count = ap.vgs.size();
       uint32_t num_vertices = dg->get_vertex_count();
       uint64_t num_tasks = vgs_count * num_vertices;
-      uint64_t num_tasks_per_item = (num_tasks / nworkers) / 8;
+      uint64_t num_tasks_per_item = (num_tasks / nworkers) / 128;
 
       uint64_t task_item_start = 0;
       while (task_item_start < num_tasks) {
@@ -1204,6 +1205,7 @@ namespace Peregrine
     // make sure the threads are all running
     barrier.join();
 
+    utils::timestamp_t working_t_sum = 0;
     auto t1 = utils::get_timestamp();
     zmq::message_t task_msg;
     uint64_t worker_tasks_completed = 0;
@@ -1214,6 +1216,7 @@ namespace Peregrine
         break;
       }
 
+      auto working_t1 = utils::get_timestamp();
       Context::gcount = 0;
 
       Context::task_ctr = task_pg_msg->msg.task.start_task;
@@ -1226,16 +1229,16 @@ namespace Peregrine
       barrier.join();
 
       uint64_t global_count = Context::gcount;
+      auto working_t2 = utils::get_timestamp();
+      working_t_sum += (working_t2 - working_t1);
 
       send_task_complete_msg(std::ref(worker_push_sock), &task_pg_msg->msg.task, global_count);
       worker_tasks_completed++;
     }
-    utils::Log{} << "worker is done all tasks in queue after completing " << worker_tasks_completed << " tasks\n";
+    utils::Log{} << "worker is done all tasks in queue after completing " << worker_tasks_completed << " tasks (" << working_t_sum/1e6 << "s of working time)\n";
 
     if (is_master) {
-      utils::Log{} << "master is joining\n";
       master.join();
-      utils::Log{} << "master is done joining\n";
     }
     auto t2 = utils::get_timestamp();
 
