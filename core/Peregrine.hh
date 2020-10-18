@@ -241,7 +241,9 @@ namespace Peregrine
       uint32_t vgs_count = ap.vgs.size();
       uint32_t num_vertices = dg->get_vertex_count();
       uint64_t num_tasks = vgs_count * num_vertices;
-      uint64_t num_tasks_per_item = (num_tasks / nworkers) / 128;
+      //uint64_t num_tasks_per_item = (num_tasks / nworkers) / 128;
+      uint64_t num_tasks_per_item = 1024;
+      std::cout << num_tasks_per_item << std::endl;
 
       uint64_t task_item_start = 0;
       while (task_item_start < num_tasks) {
