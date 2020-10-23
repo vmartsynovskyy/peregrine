@@ -104,6 +104,37 @@ namespace Peregrine
 
 namespace Peregrine
 {
+  std::pair<std::unique_ptr<zmq::socket_t>, std::unique_ptr<zmq::socket_t>>
+  create_worker_sockets(zmq::context_t &ctx, std::string master_host)
+  {
+    auto worker_pull_sock = std::make_unique<zmq::socket_t>(ctx, zmq::socket_type::pull);
+    auto worker_push_sock = std::make_unique<zmq::socket_t>(ctx, zmq::socket_type::push);
+
+    char hostname_buf[HOST_NAME_MAX + 11];
+
+    std::snprintf(hostname_buf, HOST_NAME_MAX + 11, "tcp://%s:9999", master_host.c_str());
+    worker_pull_sock->connect(hostname_buf);
+
+    std::snprintf(hostname_buf, HOST_NAME_MAX + 11, "tcp://%s:9998", master_host.c_str());
+    worker_push_sock->connect(hostname_buf);
+
+    worker_push_sock->send(zmq::str_buffer("ready"), zmq::send_flags::none);
+
+    return std::make_pair(std::move(worker_pull_sock), std::move(worker_push_sock));
+  }
+
+  std::pair<std::unique_ptr<zmq::socket_t>, std::unique_ptr<zmq::socket_t>>
+  create_master_sockets(zmq::context_t &ctx)
+  {
+    auto master_pull_sock = std::make_unique<zmq::socket_t>(ctx, zmq::socket_type::pull);
+    auto master_push_sock = std::make_unique<zmq::socket_t>(ctx, zmq::socket_type::push);
+
+    master_push_sock->bind("tcp://*:9999");
+    master_pull_sock->bind("tcp://*:9998");
+
+    return std::make_pair(std::move(master_pull_sock), std::move(master_push_sock));
+  }
+
   // for each pattern, calculate the vertex-based count
   std::vector<std::pair<SmallGraph, uint64_t>> convert_counts(std::vector<std::pair<SmallGraph, uint64_t>> edge_based, const std::vector<SmallGraph> &original_patterns)
   {
@@ -213,19 +244,18 @@ namespace Peregrine
     std::vector<uint64_t> results_map(new_patterns.size(), 0);
 
     zmq::context_t ctx;
-    zmq::socket_t master_push_sock(ctx, zmq::socket_type::push);
-    zmq::socket_t master_pull_sock(ctx, zmq::socket_type::pull);
-    master_push_sock.set(zmq::sockopt::sndhwm, 1);
+
+    auto master_sock_pair = create_master_sockets(ctx);
+    auto master_pull_sock = std::move(master_sock_pair.first);
+    auto master_push_sock = std::move(master_sock_pair.second);
 
     utils::Log{} << "---- MASTER ----\n";
-    master_push_sock.bind("tcp://*:9999");
-    master_pull_sock.bind("tcp://*:9998");
 
     zmq::message_t ready_msg;
     uint32_t num_workers_ready = 0;
     utils::Log{} << "Waiting for all workers to become ready...\n";
     while (num_workers_ready < nworkers) {
-      auto res = master_pull_sock.recv(ready_msg, zmq::recv_flags::none);
+      auto res = master_pull_sock->recv(ready_msg, zmq::recv_flags::none);
       if (res.has_value() && strcmp((char*) ready_msg.data(), "ready")) {
         num_workers_ready++;
         utils::Log{} << "[" << num_workers_ready << "/" << nworkers << "] workers are ready" << "\n";
@@ -243,7 +273,6 @@ namespace Peregrine
       uint64_t num_tasks = vgs_count * num_vertices;
       //uint64_t num_tasks_per_item = (num_tasks / nworkers) / 128;
       uint64_t num_tasks_per_item = 1024;
-      std::cout << num_tasks_per_item << std::endl;
 
       uint64_t task_item_start = 0;
       while (task_item_start < num_tasks) {
@@ -262,7 +291,7 @@ namespace Peregrine
 
         // send task message with zmq
         zmq::message_t zmq_msg(&message, sizeof(message));
-        master_push_sock.send(zmq_msg, zmq::send_flags::none);
+        master_push_sock->send(zmq_msg, zmq::send_flags::none);
         tasks_sent++;
 
         task_item_start += num_tasks_per_item;
@@ -272,7 +301,7 @@ namespace Peregrine
     utils::Log{} << "master done sending tasks\n";
 
     zmq::message_t task_complete_msg;
-    while (tasks_completed < tasks_sent && master_pull_sock.recv(task_complete_msg, zmq::recv_flags::none).has_value()) {
+    while (tasks_completed < tasks_sent && master_pull_sock->recv(task_complete_msg, zmq::recv_flags::none).has_value()) {
       struct PeregrineMessage *task_complete_pg_msg = static_cast<struct PeregrineMessage *>(task_complete_msg.data());
       results_map[task_complete_pg_msg->msg.completed_task.pattern_idx] += task_complete_pg_msg->msg.completed_task.count;
 
@@ -299,8 +328,8 @@ namespace Peregrine
     uint32_t workers_done = 0;
     while (workers_done < nworkers) {
       zmq::message_t zmq_job_done_msg(&job_done_pg_msg, sizeof(job_done_pg_msg));
-      master_push_sock.send(zmq_job_done_msg, zmq::send_flags::none);
-      if (master_pull_sock.recv(zmq_job_done_msg, zmq::recv_flags::dontwait).has_value()) {
+      master_push_sock->send(zmq_job_done_msg, zmq::send_flags::none);
+      if (master_pull_sock->recv(zmq_job_done_msg, zmq::recv_flags::dontwait).has_value()) {
         workers_done++;
       }
     }
@@ -628,7 +657,7 @@ namespace Peregrine
 
     // automatically wrap trivial types so they have .reset() etc
     constexpr bool should_be_wrapped = std::is_trivial<GivenAggValueT>::value;
-    using AggValueT = std::conditional<should_be_wrapped,
+    using AggValueT = typename std::conditional<should_be_wrapped,
       trivial_wrapper<GivenAggValueT>, GivenAggValueT>::type;
     auto view = [&viewer](auto &&v)
     {
@@ -1179,22 +1208,13 @@ namespace Peregrine
 
     zmq::context_t ctx;
 
-    zmq::socket_t worker_pull_sock(ctx, zmq::socket_type::pull);
-    zmq::socket_t worker_push_sock(ctx, zmq::socket_type::push);
-
-    char hostname_buf[HOST_NAME_MAX + 11];
-
-    std::snprintf(hostname_buf, HOST_NAME_MAX + 11, "tcp://%s:9999", master_host.c_str());
-    worker_pull_sock.connect(hostname_buf);
-
-    std::snprintf(hostname_buf, HOST_NAME_MAX + 11, "tcp://%s:9998", master_host.c_str());
-    worker_push_sock.connect(hostname_buf);
+    auto worker_sock_pair = create_worker_sockets(ctx, master_host);
+    auto worker_pull_sock = std::move(worker_sock_pair.first);
+    auto worker_push_sock = std::move(worker_sock_pair.second);
 
     if (is_master) {
       master = std::thread(count_master, &dg, std::ref(patterns), std::ref(new_patterns), nworkers, must_convert_counts, std::ref(results)); 
     }
-
-    worker_push_sock.send(zmq::str_buffer("ready"), zmq::send_flags::none);
 
     for (uint8_t i = 0; i < nthreads; ++i)
     {
@@ -1211,10 +1231,10 @@ namespace Peregrine
     auto t1 = utils::get_timestamp();
     zmq::message_t task_msg;
     uint64_t worker_tasks_completed = 0;
-    while (worker_pull_sock.recv(task_msg, zmq::recv_flags::none).has_value()) {
+    while (worker_pull_sock->recv(task_msg, zmq::recv_flags::none).has_value()) {
       struct PeregrineMessage *task_pg_msg = static_cast<struct PeregrineMessage *>(task_msg.data());
       if (task_pg_msg->msg_type == MessageType::JobDone) {
-        worker_push_sock.send(task_msg, zmq::send_flags::none);
+        worker_push_sock->send(task_msg, zmq::send_flags::none);
         break;
       }
 
@@ -1234,7 +1254,7 @@ namespace Peregrine
       auto working_t2 = utils::get_timestamp();
       working_t_sum += (working_t2 - working_t1);
 
-      send_task_complete_msg(std::ref(worker_push_sock), &task_pg_msg->msg.task, global_count);
+      send_task_complete_msg(*worker_push_sock, &task_pg_msg->msg.task, global_count);
       worker_tasks_completed++;
     }
     utils::Log{} << "worker is done all tasks in queue after completing " << worker_tasks_completed << " tasks (" << working_t_sum/1e6 << "s of working time)\n";
