@@ -110,6 +110,9 @@ namespace Peregrine
     auto worker_pull_sock = std::make_unique<zmq::socket_t>(ctx, zmq::socket_type::pull);
     auto worker_push_sock = std::make_unique<zmq::socket_t>(ctx, zmq::socket_type::push);
 
+    worker_pull_sock->set(zmq::sockopt::linger, 0);
+    worker_push_sock->set(zmq::sockopt::linger, 0);
+
     char hostname_buf[HOST_NAME_MAX + 11];
 
     std::snprintf(hostname_buf, HOST_NAME_MAX + 11, "tcp://%s:9999", master_host.c_str());
@@ -128,6 +131,9 @@ namespace Peregrine
   {
     auto master_pull_sock = std::make_unique<zmq::socket_t>(ctx, zmq::socket_type::pull);
     auto master_push_sock = std::make_unique<zmq::socket_t>(ctx, zmq::socket_type::push);
+
+    master_pull_sock->set(zmq::sockopt::linger, 0);
+    master_push_sock->set(zmq::sockopt::linger, 0);
 
     master_push_sock->bind("tcp://*:9999");
     master_pull_sock->bind("tcp://*:9998");
