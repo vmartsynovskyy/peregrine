@@ -5,7 +5,8 @@
 
 enum MessageType : uint32_t {
   Task = 0,
-  CompletedTask,
+  CompletedCountTask,
+  CompletedMatchTask,
   JobDone,
 };
 
@@ -16,17 +17,24 @@ struct Task {
   uint32_t pattern_idx;
 };
 
-struct CompletedTask {
+struct CompletedCountTask {
   uint64_t task_id;
   uint32_t pattern_idx;
   uint64_t count;
+};
+
+struct CompletedMatchTask {
+  uint64_t task_id;
+  uint32_t pattern_idx;
+  uint32_t nsets;
 };
 
 struct PeregrineMessage {
   MessageType msg_type;
   union {
     struct Task task;
-    struct CompletedTask completed_task;
+    struct CompletedMatchTask comp_m_task;
+    struct CompletedCountTask comp_c_task;
   } msg;
 };
 

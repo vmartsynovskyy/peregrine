@@ -2,6 +2,72 @@
 #define DOMAIN_HH
 
 #include "roaring/roaring.hh"
+#include <memory>
+#include <cstring>
+
+size_t
+get_serialized_size(const std::vector<Roaring> &sets)
+{
+  size_t buff_size = 0;
+  for (const auto &set : sets) {
+    size_t set_size = set.getSizeInBytes();
+    buff_size += set_size;
+  }
+  size_t header_size = sizeof(uint32_t) * sets.size();
+  buff_size += header_size;
+  return buff_size;
+}
+
+/**
+ * Serializes a vector of sets into an array of uint32_t offsets representing
+ * the size of each set followed by the char array representation of each
+ * set as given by roaring's write() function
+ */
+void
+serialize_sets(const std::vector<Roaring> &sets, char* buf)
+{
+  std::vector<uint32_t> set_sizes;
+  size_t buff_size = 0;
+  for (const auto &set : sets) {
+    size_t set_size = set.getSizeInBytes();
+    buff_size += set_size;
+    set_sizes.emplace_back(set_size);
+  }
+  size_t header_size = sizeof(uint32_t) * sets.size();
+  buff_size += header_size;
+  // copy header and move pointer forward
+  std::memcpy(buf, &set_sizes[0], header_size);
+  buf += header_size;
+
+  for (size_t i = 0; i < sets.size(); i++) {
+    // serialize set and move pointer forward
+    sets[i].write(buf);
+    buf += set_sizes[i];
+  }
+}
+
+/**
+ * Deserializes a vector of nsets roaring sets stored in the format describe
+ * in serialize_sets
+ */
+std::vector<Roaring>
+deserialize_sets(char* buf, size_t nsets)
+{
+  std::vector<Roaring> sets;
+
+  // read header and move pointer forward
+  size_t header_size = nsets * sizeof(uint32_t);
+  std::vector<uint32_t> set_sizes(buf, buf + header_size); 
+  buf += header_size;
+
+  for (size_t i = 0; i < nsets; i++) {
+    // read set and move pointer foward
+    sets.push_back(Roaring::readSafe(buf, set_sizes[i]));
+    buf += set_sizes[i];
+  }
+
+  return sets;
+}
 
 struct Domain
 {
@@ -10,6 +76,14 @@ struct Domain
    */
   Domain() : sets(Peregrine::Context::current_pattern->num_aut_sets())
   {}
+
+  Domain(uint32_t num_sets) : sets(num_sets)
+  {}
+
+  Domain(char* buf, size_t nsets)
+  {
+    sets = deserialize_sets(buf, nsets);
+  }
 
   /**
    * 'Copy' constructor is needed by Peregrine.
@@ -91,6 +165,16 @@ struct Domain
     return sets;
   }
 
+  void serialize(char *buf)
+  {
+    serialize_sets(sets, buf);
+  }
+
+  size_t get_serialized_size()
+  {
+    ::get_serialized_size(sets);
+  }
+
   std::vector<Roaring> sets;
 };
 
@@ -99,6 +183,14 @@ struct DiscoveryDomain
 {
   DiscoveryDomain() : sets(2)
   {}
+
+  DiscoveryDomain(uint32_t num_sets) : sets(2)
+  {}
+
+  DiscoveryDomain(char* buf, size_t nsets)
+  {
+    sets = deserialize_sets(buf, nsets);
+  }
 
   DiscoveryDomain(const std::pair<std::vector<uint32_t>, uint32_t> &p) : sets(1 + p.second)
   {
@@ -152,6 +244,16 @@ struct DiscoveryDomain
   const std::vector<Roaring> &get_sets() const
   {
     return sets;
+  }
+
+  void serialize(char *buf)
+  {
+    serialize_sets(sets, buf);
+  }
+
+  size_t get_serialized_size()
+  {
+    ::get_serialized_size(sets);
   }
 
   std::vector<Roaring> sets;
