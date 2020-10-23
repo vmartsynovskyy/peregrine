@@ -127,7 +127,7 @@ namespace Peregrine
   }
 
   std::pair<std::unique_ptr<zmq::socket_t>, std::unique_ptr<zmq::socket_t>>
-  create_master_sockets(zmq::context_t &ctx)
+  create_master_sockets(zmq::context_t &ctx, uint32_t nworkers)
   {
     auto master_pull_sock = std::make_unique<zmq::socket_t>(ctx, zmq::socket_type::pull);
     auto master_push_sock = std::make_unique<zmq::socket_t>(ctx, zmq::socket_type::push);
@@ -138,7 +138,37 @@ namespace Peregrine
     master_push_sock->bind("tcp://*:9999");
     master_pull_sock->bind("tcp://*:9998");
 
+    zmq::message_t ready_msg;
+    uint32_t num_workers_ready = 0;
+    utils::Log{} << "Waiting for all workers to become ready...\n";
+    while (num_workers_ready < nworkers) {
+      auto res = master_pull_sock->recv(ready_msg, zmq::recv_flags::none);
+      if (res.has_value() && strcmp((char*) ready_msg.data(), "ready")) {
+        num_workers_ready++;
+        utils::Log{} << "[" << num_workers_ready << "/" << nworkers << "] workers are ready" << "\n";
+      }
+    }
+
     return std::make_pair(std::move(master_pull_sock), std::move(master_push_sock));
+  }
+
+  void stop_workers(zmq::socket_t& master_pull_sock, zmq::socket_t& master_push_sock, uint32_t nworkers)
+  {
+    struct PeregrineMessage job_done_pg_msg = {
+      .msg_type = MessageType::JobDone,
+      .msg = {},
+    };
+    utils::Log{} << "telling workers job is done\n";
+    uint32_t workers_done = 0;
+    while (workers_done < nworkers) {
+      zmq::message_t zmq_job_done_msg(&job_done_pg_msg, sizeof(job_done_pg_msg));
+      master_push_sock.send(zmq_job_done_msg, zmq::send_flags::none);
+      if (master_pull_sock.recv(zmq_job_done_msg, zmq::recv_flags::dontwait).has_value()) {
+        workers_done++;
+      }
+    }
+
+    return;
   }
 
   // for each pattern, calculate the vertex-based count
@@ -249,24 +279,13 @@ namespace Peregrine
     if (patterns.empty()) return;
     std::vector<uint64_t> results_map(new_patterns.size(), 0);
 
-    zmq::context_t ctx;
-
-    auto master_sock_pair = create_master_sockets(ctx);
-    auto master_pull_sock = std::move(master_sock_pair.first);
-    auto master_push_sock = std::move(master_sock_pair.second);
-
     utils::Log{} << "---- MASTER ----\n";
 
-    zmq::message_t ready_msg;
-    uint32_t num_workers_ready = 0;
-    utils::Log{} << "Waiting for all workers to become ready...\n";
-    while (num_workers_ready < nworkers) {
-      auto res = master_pull_sock->recv(ready_msg, zmq::recv_flags::none);
-      if (res.has_value() && strcmp((char*) ready_msg.data(), "ready")) {
-        num_workers_ready++;
-        utils::Log{} << "[" << num_workers_ready << "/" << nworkers << "] workers are ready" << "\n";
-      }
-    }
+    zmq::context_t ctx;
+
+    auto master_sock_pair = create_master_sockets(ctx, nworkers);
+    auto master_pull_sock = std::move(master_sock_pair.first);
+    auto master_push_sock = std::move(master_sock_pair.second);
 
     auto t1 = utils::get_timestamp();
     // send tasks now that workers are ready
@@ -326,24 +345,11 @@ namespace Peregrine
     auto t2 = utils::get_timestamp();
 
     // tell all workers that job is done
-    struct PeregrineMessage job_done_pg_msg = {
-      .msg_type = MessageType::JobDone,
-      .msg = {},
-    };
-    utils::Log{} << "telling workers job is done\n";
-    uint32_t workers_done = 0;
-    while (workers_done < nworkers) {
-      zmq::message_t zmq_job_done_msg(&job_done_pg_msg, sizeof(job_done_pg_msg));
-      master_push_sock->send(zmq_job_done_msg, zmq::send_flags::none);
-      if (master_pull_sock->recv(zmq_job_done_msg, zmq::recv_flags::dontwait).has_value()) {
-        workers_done++;
-      }
-    }
+    stop_workers(*master_pull_sock, *master_push_sock, nworkers);
 
     utils::Log{} << "-------" << "\n";
     utils::Log{} << "master all patterns finished after " << (t2-t1)/1e6 << "s" << "\n";
 
-    // TODO: figure out why join on this function sometimes hangs even though the above line is printed
     return;
   }
 
