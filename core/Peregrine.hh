@@ -254,11 +254,9 @@ namespace Peregrine
     (void)a;
 
     uint32_t vgs_count = dg->get_vgs_count();
-    uint32_t num_vertices = dg->get_vertex_count();
-    uint64_t num_tasks = num_vertices * vgs_count;
 
     uint64_t task = 0;
-    while ((task = Context::task_ctr.fetch_add(1, std::memory_order_relaxed) + 1) <= num_tasks)
+    while ((task = Context::task_ctr.fetch_add(1, std::memory_order_relaxed) + 1) <= Context::task_end)
     {
       uint32_t v = (task-1) / vgs_count + 1;
       uint32_t vgsi = task % vgs_count;
@@ -378,6 +376,7 @@ namespace Peregrine
       results_map[pattern_idx] += agg_result;
 
       tasks_completed++;
+      utils::Log{} << "received completed task\n";
     }
     utils::Log{} << "master done receiving tasks\n";
 
@@ -507,8 +506,20 @@ namespace Peregrine
 
       if (has_anti_edges)
       {
-        utils::Log{} << "anti edges not supported\n";
-        exit(1);
+        const auto process = [&lcount](const CompleteMatch &) { lcount += 1; };
+        // dummy
+        struct {void submit() {}} ah;
+
+        // TODO anti-edges ruin a lot of optimizations, but not all,
+        // is there no way to handle them in Counter?
+        if (has_anti_vertices)
+        {
+          CALL_MATCH_LOOP_PARALLEL(L, true, true);
+        }
+        else
+        {
+          CALL_MATCH_LOOP_PARALLEL(L, true, false);
+        }
       }
       else
       {
@@ -822,7 +833,28 @@ namespace Peregrine
   struct trivial_wrapper
   {
     trivial_wrapper() : val() {}
+    trivial_wrapper(uint32_t num_sets) : val() {}
     trivial_wrapper(T v) : val(v) {}
+    trivial_wrapper(char* buf, size_t n)
+    {
+      memcpy(&val, buf, sizeof(val));
+    }
+
+    void serialize(char *buf)
+    {
+      memcpy(buf, &val, sizeof(val));
+    }
+
+    size_t get_serialized_size()
+    {
+      return sizeof(val);
+    }
+
+    uint32_t getN()
+    {
+      return 1;
+    }
+
     trivial_wrapper<T> &operator+=(const trivial_wrapper<T> &other) { val += other.val; return *this; }
     void reset() { val = T(); }
     T val;
@@ -914,6 +946,99 @@ namespace Peregrine
     else
     {
       return match_multi<AggKeyT, AggValueT, OnTheFly, Stoppable>(process, view, nworkers, data_graph, patterns);
+    }
+  }
+
+  template <
+    typename AggKeyT,
+    typename GivenAggValueT,
+    typename DataGraphT,
+    typename PF,
+    typename VF = decltype(default_viewer<GivenAggValueT>)
+  >
+  std::vector<std::pair<SmallGraph, decltype(std::declval<VF>()(std::declval<GivenAggValueT>()))>>
+  match_parallel(DataGraphT &&data_graph,
+      const std::vector<SmallGraph> &patterns,
+      size_t nthreads,
+      size_t nworkers,
+      bool is_master,
+      std::string master_host,
+      PF &&process,
+      VF viewer = default_viewer<GivenAggValueT>)
+  {
+    if (patterns.empty())
+    {
+      return {};
+    }
+
+    // automatically wrap trivial types so they have .reset() etc
+    constexpr bool should_be_wrapped = std::is_trivial<GivenAggValueT>::value;
+    using AggValueT = typename std::conditional<should_be_wrapped,
+      trivial_wrapper<GivenAggValueT>, GivenAggValueT>::type;
+    auto view = [&viewer](auto &&v)
+    {
+      if constexpr (should_be_wrapped)
+      {
+        return viewer(std::move(v.val));
+      }
+      else
+      {
+        return viewer(v);
+      }
+    };
+
+    // optimize AggKeyT == Pattern
+    if constexpr (std::is_same_v<AggKeyT, Pattern>)
+    {
+      std::vector<SmallGraph> single;
+      std::vector<SmallGraph> vector;
+      std::vector<SmallGraph> multi;
+
+      for (const auto &p : patterns)
+      {
+        Graph::Labelling l = p.get_labelling();
+        switch (l)
+        {
+          case Graph::LABELLED:
+          case Graph::UNLABELLED:
+            single.emplace_back(p);
+            break;
+          case Graph::PARTIALLY_LABELLED:
+            vector.emplace_back(p);
+            break;
+          case Graph::DISCOVER_LABELS:
+            multi.emplace_back(p);
+            break;
+        }
+      }
+
+      if (!single.empty()
+          && std::is_integral_v<GivenAggValueT>)
+      {
+        utils::Log{}
+          << "WARN: If you are counting, Peregrine::count() is much faster!"
+          << "\n";
+      }
+
+      auto result = match_single_parallel<AggValueT>(process, view, nthreads, data_graph, single, is_master, nworkers, master_host);
+      if (!vector.empty()) {
+        utils::Log{} << "WARN: results will be incomplete, match_vector_parallel is not yet implemented\n";
+      }
+      if (!multi.empty()) {
+        utils::Log{} << "WARN: results will be incomplete, match_multi_parallel is not yet implemented\n";
+      }
+      //auto vector_result = match_vector<AggValueT, OnTheFly, Stoppable>(process, view, nworkers, data_graph, vector);
+      //auto multi_result = match_multi<AggKeyT, AggValueT, OnTheFly, Stoppable>(process, view, nworkers, data_graph, multi);
+
+      //result.insert(result.end(), vector_result.begin(), vector_result.end());
+      //result.insert(result.end(), multi_result.begin(), multi_result.end());
+
+      return result;
+    }
+    else
+    {
+      utils::Log{} << "WARN: match_multi parallel version is not yet implemented\n";
+      return match_multi<AggKeyT, AggValueT, Peregrine::AT_THE_END, Peregrine::UNSTOPPABLE>(process, view, nworkers, data_graph, patterns);
     }
   }
 
@@ -1189,11 +1314,10 @@ namespace Peregrine
   zmq::send_result_t
   send_match_task_complete_msg(zmq::socket_t &socket, struct Task *task, AggValueT &agg_value)
   {
-    auto sets = agg_value.get_sets();
     struct CompletedMatchTask completed_task = {
       .task_id      = task->task_id,
       .pattern_idx  = task->pattern_idx,
-      .nsets        = sets.size(),
+      .nsets        = agg_value.getN(),
     };
     struct PeregrineMessage pg_completed_task_msg = {
       .msg_type = MessageType::CompletedMatchTask,
@@ -1240,7 +1364,7 @@ namespace Peregrine
     auto [worker_pull_sock, worker_push_sock] = create_worker_sockets(ctx, master_host);
 
     if (is_master) {
-      master = std::thread(match_single_master<AggValueT, VF>, &dg, std::ref(patterns), nworkers, std::ref(results), viewer); 
+      master = std::thread(match_single_master<AggValueT, decltype(viewer)>, &dg, std::ref(patterns), nworkers, std::ref(results), std::ref(viewer)); 
     }
 
     SVAggregator<AggValueT, Peregrine::AT_THE_END, Peregrine::UNSTOPPABLE, decltype(viewer)> aggregator(nthreads, viewer);
@@ -1307,6 +1431,10 @@ namespace Peregrine
     for (auto &th : pool)
     {
       th.join();
+    }
+
+    if (is_master) {
+      master.join();
     }
 
     utils::Log{} << "-------" << "\n";

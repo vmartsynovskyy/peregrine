@@ -16,13 +16,17 @@ int main(int argc, char *argv[])
 {
   if (argc < 3)
   {
-    std::cerr << "USAGE: " << argv[0] << " <data graph> <pattern | #-clique> [# threads]" << std::endl;
+    std::cerr << "USAGE: " << argv[0] << " <data graph> <pattern | #-motifs | #-clique> <# threads> <master|hostname-of-master for workers> [# workers]" << std::endl;
     return -1;
   }
 
   const std::string data_graph_name(argv[1]);
   const std::string pattern_name(argv[2]);
-  size_t nthreads = argc < 4 ? 1 : std::stoi(argv[3]);
+  size_t nthreads = std::stoi(argv[3]);
+  bool is_parallel = argc > 4;
+  bool is_master = is_parallel ? std::string(argv[4]) == "master" : false;
+  std::string master_host = !is_master && argc > 4 ? std::string(argv[4]) : "127.0.0.1";
+  size_t num_workers = argc > 5 ? std::stoi(argv[5]) : 1;
 
   std::vector<Peregrine::SmallGraph> patterns;
 
@@ -39,9 +43,15 @@ int main(int argc, char *argv[])
     display_name = patterns.front().to_string();
   }
 
-  const auto process = [](auto &&a, auto &&cm) { a.map(cm.pattern, true); a.stop(); };
+  std::vector<std::pair<Peregrine::SmallGraph, bool>> results;
 
-  std::vector<std::pair<Peregrine::SmallGraph, bool>> results = Peregrine::match<Peregrine::Pattern, bool, Peregrine::ON_THE_FLY, Peregrine::STOPPABLE>(data_graph_name, patterns, nthreads, process);
+  if (is_parallel) {
+    const auto process = [](auto &&a, auto &&cm) { a.map(cm.pattern, true); /* a.stop(); */ };
+    results = Peregrine::match_parallel<Peregrine::Pattern, bool>(data_graph_name, patterns, nthreads, num_workers, is_master, master_host, process);
+  } else {
+    const auto process = [](auto &&a, auto &&cm) { a.map(cm.pattern, true); a.stop(); };
+    results = Peregrine::match<Peregrine::Pattern, bool, Peregrine::ON_THE_FLY, Peregrine::STOPPABLE>(data_graph_name, patterns, nthreads, process);
+  }
 
   std::cout << display_name;
   if (results.front().second) std::cout << " exists in " << data_graph_name << std::endl;

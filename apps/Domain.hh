@@ -172,7 +172,12 @@ struct Domain
 
   size_t get_serialized_size()
   {
-    ::get_serialized_size(sets);
+    return ::get_serialized_size(sets);
+  }
+
+  uint32_t getN()
+  {
+    return sets.size();
   }
 
   std::vector<Roaring> sets;
@@ -253,7 +258,12 @@ struct DiscoveryDomain
 
   size_t get_serialized_size()
   {
-    ::get_serialized_size(sets);
+    return ::get_serialized_size(sets);
+  }
+
+  uint32_t getN()
+  {
+    return sets.size();
   }
 
   std::vector<Roaring> sets;
