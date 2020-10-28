@@ -16,7 +16,10 @@
 #include "PatternGenerator.hh"
 #include "PatternMatching.hh"
 #include "MessageTypes.hh"
+
 #include "zmq/zmq.hpp"
+
+#include <cereal/archives/binary.hpp>
 
 #define CALL_COUNT_LOOP_PARALLEL(L, has_anti_vertices)\
 {\
@@ -188,7 +191,7 @@ namespace Peregrine
 
     // send task message with zmq
     zmq::message_t zmq_msg(&message, sizeof(message));
-    return socket.send(zmq_msg, zmq::send_flags::dontwait);
+    return socket.send(zmq_msg, zmq::send_flags::none);
   }
 
   void stop_workers(zmq::socket_t& master_pull_sock, zmq::socket_t& master_push_sock, uint32_t nworkers)
@@ -372,10 +375,15 @@ namespace Peregrine
       struct PeregrineMessage *task_complete_pg_msg = static_cast<struct PeregrineMessage *>(task_complete_msg.data());
 
       uint32_t pattern_idx = task_complete_pg_msg->msg.comp_m_task.pattern_idx;
-      uint32_t nsets = task_complete_pg_msg->msg.comp_m_task.nsets;
 
-      char *sets_buf = static_cast<char *>(task_complete_msg.data()) + sizeof(struct PeregrineMessage);
-      AggValueT agg_result(sets_buf, nsets);
+      AggValueT agg_result;
+      char *serial_data = static_cast<char *>(task_complete_msg.data()) + sizeof(struct PeregrineMessage);
+      size_t serial_data_size = task_complete_msg.size() - sizeof(struct PeregrineMessage);
+      std::stringstream ss(std::string(serial_data, serial_data_size));
+      {
+        cereal::BinaryInputArchive archive(ss);
+        archive(agg_result);
+      }
 
       results_map[pattern_idx] += agg_result;
 
@@ -825,6 +833,12 @@ namespace Peregrine
     trivial_wrapper(char* buf, size_t n)
     {
       memcpy(&val, buf, sizeof(val));
+    }
+
+    template<class Archive>
+    void serialize(Archive &archive)
+    {
+      archive(val);
     }
 
     void serialize(char *buf)
@@ -1312,11 +1326,17 @@ namespace Peregrine
     };
     pg_completed_task_msg.msg.comp_m_task = completed_task;
 
-    zmq::message_t zmq_msg(sizeof(pg_completed_task_msg) + agg_value.get_serialized_size());
+    std::stringstream ss;
+    {
+      cereal::BinaryOutputArchive archive(ss);
+
+      archive(agg_value);
+    }
+    auto serial_data = ss.str();
+    zmq::message_t zmq_msg(sizeof(pg_completed_task_msg) + serial_data.length());
     char *msg_buff = static_cast<char*>(zmq_msg.data());
     std::memcpy(msg_buff, &pg_completed_task_msg, sizeof(pg_completed_task_msg));
-
-    agg_value.serialize(msg_buff + sizeof(pg_completed_task_msg));
+    std::memcpy(msg_buff + sizeof(pg_completed_task_msg), serial_data.data(), serial_data.size());
 
     return socket.send(zmq_msg, zmq::send_flags::dontwait);
   }
