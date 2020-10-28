@@ -142,7 +142,7 @@ namespace Peregrine
 
     worker_push_sock->send(zmq::str_buffer("ready"), zmq::send_flags::none);
 
-    return std::make_pair(std::move(worker_pull_sock), std::move(worker_push_sock));
+    return std::pair(std::move(worker_pull_sock), std::move(worker_push_sock));
   }
 
   std::pair<std::unique_ptr<zmq::socket_t>, std::unique_ptr<zmq::socket_t>>
@@ -168,7 +168,28 @@ namespace Peregrine
       }
     }
 
-    return std::make_pair(std::move(master_pull_sock), std::move(master_push_sock));
+    return std::pair(std::move(master_pull_sock), std::move(master_push_sock));
+  }
+
+  zmq::send_result_t
+  send_task_msg(zmq::socket_t &socket, uint64_t start_task, uint64_t end_task, uint64_t task_id, uint32_t pattern_idx)
+  {
+    struct Task task = {
+      .task_id        = task_id,
+      .start_task     = start_task,
+      .end_task       = end_task,
+      .pattern_idx    = pattern_idx,
+    };
+    struct PeregrineMessage message = {
+      .msg_type   = MessageType::Task,
+      .msg        = {},
+    };
+    message.msg.task = task;
+
+    // send task message with zmq
+    zmq::message_t zmq_msg(&message, sizeof(message));
+    socket.send(zmq_msg, zmq::send_flags::none);
+    return socket.send(zmq_msg, zmq::send_flags::dontwait);
   }
 
   void stop_workers(zmq::socket_t& master_pull_sock, zmq::socket_t& master_push_sock, uint32_t nworkers)
@@ -177,7 +198,6 @@ namespace Peregrine
       .msg_type = MessageType::JobDone,
       .msg = {},
     };
-    utils::Log{} << "telling workers job is done\n";
     uint32_t workers_done = 0;
     while (workers_done < nworkers) {
       zmq::message_t zmq_job_done_msg(&job_done_pg_msg, sizeof(job_done_pg_msg));
@@ -244,6 +264,27 @@ namespace Peregrine
     }
   }
 
+  template <Graph::Labelling L, bool has_anti_vertices>
+  inline uint64_t count_loop(DataGraph *dg, std::vector<std::vector<uint32_t>> &cands)
+  {
+    uint32_t vgs_count = dg->get_vgs_count();
+    uint32_t num_vertices = dg->get_vertex_count();
+    uint64_t num_tasks = num_vertices * vgs_count;
+
+    uint64_t lcount = 0;
+
+    uint64_t task = 0;
+    while ((task = Context::task_ctr.fetch_add(1, std::memory_order_relaxed) + 1) <= num_tasks)
+    {
+      uint32_t v = (task-1) / vgs_count + 1;
+      uint32_t vgsi = task % vgs_count;
+      Counter<has_anti_vertices> m(dg->rbi, dg, vgsi, cands);
+      lcount += m.template map_into<L>(v);
+    }
+
+    return lcount;
+  }
+
   template <Graph::Labelling L,
     bool has_anti_edges,
     bool has_anti_vertices,
@@ -284,27 +325,6 @@ namespace Peregrine
     return lcount;
   }
 
-  template <Graph::Labelling L, bool has_anti_vertices>
-  inline uint64_t count_loop(DataGraph *dg, std::vector<std::vector<uint32_t>> &cands)
-  {
-    uint32_t vgs_count = dg->get_vgs_count();
-    uint32_t num_vertices = dg->get_vertex_count();
-    uint64_t num_tasks = num_vertices * vgs_count;
-
-    uint64_t lcount = 0;
-
-    uint64_t task = 0;
-    while ((task = Context::task_ctr.fetch_add(1, std::memory_order_relaxed) + 1) <= num_tasks)
-    {
-      uint32_t v = (task-1) / vgs_count + 1;
-      uint32_t vgsi = task % vgs_count;
-      Counter<has_anti_vertices> m(dg->rbi, dg, vgsi, cands);
-      lcount += m.template map_into<L>(v);
-    }
-
-    return lcount;
-  }
-
   template <typename AggValueT, typename VF>
   void
   match_single_master(
@@ -323,10 +343,10 @@ namespace Peregrine
 
     zmq::context_t ctx;
 
+    // blocks until workers are all ready
     auto [master_pull_sock, master_push_sock] = create_master_sockets(ctx, nworkers);
 
     auto t1 = utils::get_timestamp();
-    // send tasks now that workers are ready
     uint64_t tasks_sent = 0;
     uint64_t tasks_completed = 0;
     for (uint32_t i = 0; i < (uint32_t) patterns.size(); i++) {
@@ -339,22 +359,7 @@ namespace Peregrine
 
       uint64_t task_item_start = 0;
       while (task_item_start < num_tasks) {
-        // construct a task message
-        struct Task task = {
-          .task_id        = tasks_sent,
-          .start_task     = task_item_start,
-          .end_task       = std::min(task_item_start + num_tasks_per_item, num_tasks + 1),
-          .pattern_idx    = i,
-        };
-        struct PeregrineMessage message = {
-          .msg_type   = MessageType::Task,
-          .msg        = {},
-        };
-        message.msg.task = task;
-
-        // send task message with zmq
-        zmq::message_t zmq_msg(&message, sizeof(message));
-        master_push_sock->send(zmq_msg, zmq::send_flags::none);
+        send_task_msg(*master_push_sock, task_item_start, std::min(task_item_start + num_tasks_per_item, num_tasks + 1), tasks_sent, i);
         tasks_sent++;
 
         task_item_start += num_tasks_per_item;
@@ -376,7 +381,6 @@ namespace Peregrine
       results_map[pattern_idx] += agg_result;
 
       tasks_completed++;
-      utils::Log{} << "received completed task\n";
     }
     utils::Log{} << "master done receiving tasks\n";
 
@@ -426,27 +430,11 @@ namespace Peregrine
       uint32_t vgs_count = ap.vgs.size();
       uint32_t num_vertices = dg->get_vertex_count();
       uint64_t num_tasks = vgs_count * num_vertices;
-      //uint64_t num_tasks_per_item = (num_tasks / nworkers) / 128;
       uint64_t num_tasks_per_item = 1024;
 
       uint64_t task_item_start = 0;
       while (task_item_start < num_tasks) {
-        // construct a task message
-        struct Task task = {
-          .task_id        = tasks_sent,
-          .start_task     = task_item_start,
-          .end_task       = std::min(task_item_start + num_tasks_per_item, num_tasks + 1),
-          .pattern_idx    = i,
-        };
-        struct PeregrineMessage message = {
-          .msg_type   = MessageType::Task,
-          .msg        = {},
-        };
-        message.msg.task = task;
-
-        // send task message with zmq
-        zmq::message_t zmq_msg(&message, sizeof(message));
-        master_push_sock->send(zmq_msg, zmq::send_flags::none);
+        send_task_msg(*master_push_sock, task_item_start, std::min(task_item_start + num_tasks_per_item, num_tasks + 1), tasks_sent, i);
         tasks_sent++;
 
         task_item_start += num_tasks_per_item;
