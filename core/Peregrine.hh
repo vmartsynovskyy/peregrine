@@ -188,7 +188,6 @@ namespace Peregrine
 
     // send task message with zmq
     zmq::message_t zmq_msg(&message, sizeof(message));
-    socket.send(zmq_msg, zmq::send_flags::none);
     return socket.send(zmq_msg, zmq::send_flags::dontwait);
   }
 
