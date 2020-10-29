@@ -26,7 +26,6 @@ struct CompletedCountTask {
 struct CompletedMatchTask {
   uint64_t task_id;
   uint32_t pattern_idx;
-  uint32_t nsets;
 };
 
 struct PeregrineMessage {

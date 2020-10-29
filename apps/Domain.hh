@@ -2,49 +2,52 @@
 #define DOMAIN_HH
 
 #include "roaring/roaring.hh"
+#include "Peregrine.hh"
+#include <cereal/archives/binary.hpp>
+#include <cereal/types/vector.hpp>
 #include <memory>
 #include <cstring>
 
-size_t
-get_serialized_size(const std::vector<Roaring> &sets)
-{
-  size_t buff_size = 0;
-  for (const auto &set : sets) {
-    size_t set_size = set.getSizeInBytes();
-    buff_size += set_size;
-  }
-  size_t header_size = sizeof(uint32_t) * sets.size();
-  buff_size += header_size;
-  return buff_size;
-}
+// size_t
+// get_serialized_size(const std::vector<Roaring> &sets)
+// {
+//   size_t buff_size = 0;
+//   for (const auto &set : sets) {
+//     size_t set_size = set.getSizeInBytes();
+//     buff_size += set_size;
+//   }
+//   size_t header_size = sizeof(uint32_t) * sets.size();
+//   buff_size += header_size;
+//   return buff_size;
+// }
 
 /**
  * Serializes a vector of sets into an array of uint32_t offsets representing
  * the size of each set followed by the char array representation of each
  * set as given by roaring's write() function
  */
-void
-serialize_sets(const std::vector<Roaring> &sets, char* buf)
-{
-  std::vector<uint32_t> set_sizes;
-  size_t buff_size = 0;
-  for (const auto &set : sets) {
-    size_t set_size = set.getSizeInBytes();
-    buff_size += set_size;
-    set_sizes.emplace_back(set_size);
-  }
-  size_t header_size = sizeof(uint32_t) * sets.size();
-  buff_size += header_size;
-  // copy header and move pointer forward
-  std::memcpy(buf, &set_sizes[0], header_size);
-  buf += header_size;
-
-  for (size_t i = 0; i < sets.size(); i++) {
-    // serialize set and move pointer forward
-    sets[i].write(buf);
-    buf += set_sizes[i];
-  }
-}
+// void
+// serialize_sets(const std::vector<Roaring> &sets, char* buf)
+// {
+//   std::vector<uint32_t> set_sizes;
+//   size_t buff_size = 0;
+//   for (const auto &set : sets) {
+//     size_t set_size = set.getSizeInBytes();
+//     buff_size += set_size;
+//     set_sizes.emplace_back(set_size);
+//   }
+//   size_t header_size = sizeof(uint32_t) * sets.size();
+//   buff_size += header_size;
+//   // copy header and move pointer forward
+//   std::memcpy(buf, &set_sizes[0], header_size);
+//   buf += header_size;
+// 
+//   for (size_t i = 0; i < sets.size(); i++) {
+//     // serialize set and move pointer forward
+//     sets[i].write(buf);
+//     buf += set_sizes[i];
+//   }
+// }
 
 /**
  * Deserializes a vector of nsets roaring sets stored in the format describe
@@ -165,14 +168,10 @@ struct Domain
     return sets;
   }
 
-  void serialize(char *buf)
+  template<class Archive>
+  void serialize(Archive &archive)
   {
-    serialize_sets(sets, buf);
-  }
-
-  size_t get_serialized_size()
-  {
-    return ::get_serialized_size(sets);
+    archive(sets);
   }
 
   uint32_t getN()
@@ -182,7 +181,6 @@ struct Domain
 
   std::vector<Roaring> sets;
 };
-
 
 struct DiscoveryDomain
 {
@@ -251,14 +249,10 @@ struct DiscoveryDomain
     return sets;
   }
 
-  void serialize(char *buf)
+  template<class Archive>
+  void serialize(Archive &archive)
   {
-    serialize_sets(sets, buf);
-  }
-
-  size_t get_serialized_size()
-  {
-    return ::get_serialized_size(sets);
+    archive(sets);
   }
 
   uint32_t getN()
@@ -269,5 +263,27 @@ struct DiscoveryDomain
   std::vector<Roaring> sets;
 };
 
+template<class Archive>
+void save(Archive & archive, Roaring const & r)
+{ 
+  auto r_buf_size = r.getSizeInBytes();
+  auto r_buf = std::make_unique<unsigned char []>(r_buf_size);
+  r.write((char *)&r_buf, r_buf_size);
+
+  archive(cereal::make_size_tag(r_buf_size));
+  archive(cereal::binary_data(&r_buf, r_buf_size)); 
+}
+
+template<class Archive>
+void load(Archive & archive, Roaring & r)
+{ 
+  size_t r_buf_size;
+  archive(cereal::make_size_tag(r_buf_size));
+
+  auto r_buf = std::make_unique<unsigned char []>(r_buf_size);
+  archive(cereal::binary_data(&r_buf, r_buf_size)); 
+
+  r.readSafe((char *)&r_buf, r_buf_size);
+}
 
 #endif

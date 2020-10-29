@@ -842,16 +842,6 @@ namespace Peregrine
       archive(val);
     }
 
-    void serialize(char *buf)
-    {
-      memcpy(buf, &val, sizeof(val));
-    }
-
-    size_t get_serialized_size()
-    {
-      return sizeof(val);
-    }
-
     uint32_t getN()
     {
       return 1;
@@ -1319,7 +1309,6 @@ namespace Peregrine
     struct CompletedMatchTask completed_task = {
       .task_id      = task->task_id,
       .pattern_idx  = task->pattern_idx,
-      .nsets        = agg_value.getN(),
     };
     struct PeregrineMessage pg_completed_task_msg = {
       .msg_type = MessageType::CompletedMatchTask,
