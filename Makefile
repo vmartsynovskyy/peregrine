@@ -13,6 +13,9 @@ core/roaring.o: core/roaring/roaring.c
 %.o: %.cc
 	$(CC) -c $? -o $@ $(CFLAGS)
 
+fsm-single: apps/fsm-single.cc $(OBJ) core/roaring.o bliss
+	$(CC) apps/fsm-single.cc $(OBJ) core/roaring.o -o $(OUTDIR)/$@ $(LDFLAGS) $(CFLAGS)
+
 fsm: apps/fsm.cc $(OBJ) core/roaring.o bliss
 	$(CC) apps/fsm.cc $(OBJ) core/roaring.o -o $(OUTDIR)/$@ $(LDFLAGS) $(CFLAGS)
 
