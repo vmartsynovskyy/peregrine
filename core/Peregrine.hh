@@ -353,7 +353,7 @@ namespace Peregrine
     uint64_t tasks_completed = 0;
     for (uint32_t i = 0; i < (uint32_t) patterns.size(); i++) {
       AnalyzedPattern ap(patterns[i]);
-      results_map.emplace_back(ap.num_aut_sets());
+      results_map.emplace_back(ap.num_aut_sets(), true);
       uint32_t vgs_count = ap.vgs.size();
       uint32_t num_vertices = dg->get_vertex_count();
       uint64_t num_tasks = vgs_count * num_vertices;
@@ -828,7 +828,8 @@ namespace Peregrine
   struct trivial_wrapper
   {
     trivial_wrapper() : val() {}
-    trivial_wrapper(uint32_t num_sets) : val() {}
+    // add always_true to prevent overload collision with other constructor
+    trivial_wrapper(size_t num_sets, bool always_true) : val() {}
     trivial_wrapper(T v) : val(v) {}
     trivial_wrapper(char* buf, size_t n)
     {

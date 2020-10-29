@@ -77,7 +77,7 @@ struct Domain
   Domain() : sets(Peregrine::Context::current_pattern->num_aut_sets())
   {}
 
-  Domain(uint32_t num_sets) : sets(num_sets)
+  Domain(size_t num_sets, bool always_true) : sets(num_sets)
   {}
 
   Domain(char* buf, size_t nsets)
@@ -189,7 +189,7 @@ struct DiscoveryDomain
   DiscoveryDomain() : sets(2)
   {}
 
-  DiscoveryDomain(uint32_t num_sets) : sets(2)
+  DiscoveryDomain(size_t num_sets, bool always_true) : sets(2)
   {}
 
   DiscoveryDomain(char* buf, size_t nsets)
