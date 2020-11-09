@@ -18,6 +18,7 @@
 #include "MessageTypes.hh"
 
 #include "zmq/zmq.hpp"
+#include "zmq/zmq_addon.hpp"
 
 #include <cereal/archives/binary.hpp>
 #include <cereal/types/vector.hpp>
@@ -128,6 +129,95 @@ namespace Peregrine
 
 namespace Peregrine
 {
+  struct Master {
+    std::unique_ptr<zmq::socket_t> sock;
+    size_t nworkers;
+    zmq::context_t context;
+    std::unique_ptr<DataGraph> data_graph;
+    std::vector<std::string> worker_ids;
+  };
+
+  class TaskIterator
+  {
+  public:
+    uint64_t num_tasks_per_item = 1024;
+    class iterator: public std::iterator<std::input_iterator_tag, struct Task>
+    {
+      const DataGraph &dg;
+      const std::vector<SmallGraph> &patterns;
+      uint64_t curr_task_id = 0;
+      uint64_t task_item_start = 0;
+      uint64_t num_tasks_per_item = 1024;
+      uint64_t num_tasks = 0;
+      size_t pattern_idx = 0;
+
+    public:
+      bool end = false;
+      explicit iterator(const DataGraph &dg, const std::vector<SmallGraph> &patterns,
+                        size_t pattern_idx, uint64_t task_item_start)
+        : dg(dg), patterns(patterns), task_item_start(task_item_start), pattern_idx(pattern_idx)
+      {
+        AnalyzedPattern ap(patterns[pattern_idx]);
+        uint32_t vgs_count = ap.vgs.size();
+        uint32_t num_vertices = dg.get_vertex_count();
+        num_tasks = vgs_count * num_vertices;
+      }
+
+      iterator& operator++()
+      {
+        AnalyzedPattern ap(patterns[pattern_idx]);
+        uint32_t vgs_count = ap.vgs.size();
+        uint32_t num_vertices = dg.get_vertex_count();
+        uint64_t num_tasks = vgs_count * num_vertices;
+
+        curr_task_id++;
+        task_item_start += num_tasks_per_item;
+        if (task_item_start > num_tasks) {
+          pattern_idx++;
+          if (pattern_idx >= patterns.size()) {
+            end = true;
+            return *this;
+          }
+          task_item_start = 0;
+          AnalyzedPattern ap(patterns[pattern_idx]);
+          uint32_t vgs_count = ap.vgs.size();
+          uint32_t num_vertices = dg.get_vertex_count();
+          num_tasks = vgs_count * num_vertices;
+        }
+
+        return *this;
+      }
+
+      value_type operator*() const
+      {
+        struct Task task {
+          .task_id     = curr_task_id,
+          .start_task  = task_item_start,
+          .end_task    = std::min(task_item_start + num_tasks_per_item, num_tasks + 1),
+          .pattern_idx = (uint32_t) pattern_idx,
+        };
+        return task;
+      }
+    };
+
+    const DataGraph& dg;
+    const std::vector<SmallGraph> &patterns;
+
+    TaskIterator(const DataGraph &dg, const std::vector<SmallGraph> &patterns)
+      : dg(dg), patterns(patterns) {}
+
+    iterator begin()
+    {
+      return iterator(dg, patterns, 0, 0);
+    }
+  };
+
+  struct Worker {
+    std::unique_ptr<zmq::socket_t> sock;
+    zmq::context_t context;
+    size_t nthreads;
+  };
+
   std::pair<std::unique_ptr<zmq::socket_t>, std::unique_ptr<zmq::socket_t>>
   create_worker_sockets(zmq::context_t &ctx, std::string master_host)
   {
@@ -176,6 +266,27 @@ namespace Peregrine
     return std::pair(std::move(master_pull_sock), std::move(master_push_sock));
   }
 
+  bool
+  send_task_msg(zmq::socket_t &socket, const std::string &worker_id, struct Task task)
+  {
+    struct PeregrineMessage message = {
+      .msg_type   = MessageType::Task,
+      .msg        = {},
+    };
+    message.msg.task = task;
+
+    utils::Log{} << task.start_task << ":" << task.end_task << " " << task.pattern_idx << "\n";
+
+    zmq::multipart_t zmq_multi_msg;
+    zmq_multi_msg.addstr(worker_id);
+    zmq_multi_msg.addstr("");
+
+    // send task message with zmq
+    zmq::message_t zmq_msg(&message, sizeof(message));
+    zmq_multi_msg.add(std::move(zmq_msg));
+    return zmq_multi_msg.send(socket, 0);
+  }
+
   zmq::send_result_t
   send_task_msg(zmq::socket_t &socket, uint64_t start_task, uint64_t end_task, uint64_t task_id, uint32_t pattern_idx)
   {
@@ -194,6 +305,24 @@ namespace Peregrine
     // send task message with zmq
     zmq::message_t zmq_msg(&message, sizeof(message));
     return socket.send(zmq_msg, zmq::send_flags::none);
+  }
+
+  void stop_workers(Master &master)
+  {
+    struct PeregrineMessage job_done_pg_msg = {
+      .msg_type = MessageType::JobDone,
+      .msg = {},
+    };
+    for (auto worker_id : master.worker_ids) {
+      zmq::message_t zmq_job_done_msg(&job_done_pg_msg, sizeof(job_done_pg_msg));
+      zmq::multipart_t zmq_multi_msg;
+      zmq_multi_msg.addstr(worker_id);
+      zmq_multi_msg.addstr("");
+      zmq_multi_msg.add(std::move(zmq_job_done_msg));
+      zmq_multi_msg.send(*master.sock, 0);
+    }
+
+    return;
   }
 
   void stop_workers(zmq::socket_t& master_pull_sock, zmq::socket_t& master_push_sock, uint32_t nworkers)
@@ -596,57 +725,227 @@ namespace Peregrine
     return;
   }
 
+  std::vector<SmallGraph>
+  read_patterns(
+      const std::string &data_str
+  )
+  {
+    std::vector<SmallGraph> results;
+    std::stringstream ss(data_str);
+    {
+      cereal::BinaryInputArchive archive(ss);
+      archive(results);
+    }
+
+    for (const auto &p : results)
+    {
+      std::cout << p << std::endl;
+    }
+
+    return results;
+  }
+
   void
-  count_master(
-      DataGraph *dg,
-      const std::vector<SmallGraph> &patterns,
-      const std::vector<SmallGraph> &new_patterns,
-      uint32_t nworkers,
-      bool must_convert_counts,
-      std::vector<std::pair<SmallGraph, uint64_t>> &results
+  send_patterns_to_workers(
+      const Master &master,
+      const std::vector<SmallGraph> &patterns
+  )
+  {
+    for (auto &identity : master.worker_ids) {
+      zmq::multipart_t multi_msg;
+      multi_msg.addstr(identity);
+      multi_msg.addstr("");
+
+      struct PeregrineMessage pattern_pg_msg;
+      pattern_pg_msg.msg_type = MessageType::Patterns;
+      std::stringstream ss;
+      {
+        cereal::BinaryOutputArchive archive(ss);
+
+        archive(patterns);
+      }
+      auto serial_data = ss.str();
+      zmq::message_t pattern_msg(sizeof(pattern_pg_msg) + serial_data.length());
+      char *msg_buff = static_cast<char*>(pattern_msg.data());
+      std::memcpy(msg_buff, &pattern_pg_msg, sizeof(pattern_pg_msg));
+      std::memcpy(msg_buff + sizeof(pattern_pg_msg), serial_data.data(), serial_data.size());
+      multi_msg.add(std::move(pattern_msg));
+
+      multi_msg.send(*master.sock, 0);
+      utils::Log{} << "send pattern\n";
+    }
+  }
+
+  void
+  send_work_type_to_workers(
+      const Master &master,
+      enum WorkType work_type
+  )
+  {
+    for (auto &identity : master.worker_ids) {
+      zmq::multipart_t multi_msg;
+      multi_msg.addstr(identity);
+      multi_msg.addstr("");
+
+      struct PeregrineMessage worktype_pg_msg;
+      worktype_pg_msg.msg_type = MessageType::WorkType;
+
+      struct WorkTypeMessage worktype_msg {work_type};
+      worktype_pg_msg.msg.work_type_msg = worktype_msg;
+      multi_msg.addmem(&worktype_pg_msg, sizeof(worktype_pg_msg));
+      
+      multi_msg.send(*master.sock, 0);
+    }
+  }
+
+  std::tuple<struct PeregrineMessage, std::string, std::string>
+  get_pg_msg_data_and_id(
+      const Master &master
+  )
+  {
+    zmq::multipart_t multi_msg(*master.sock);
+    // data part
+    const auto &pg_zmq_msg = multi_msg.remove();
+    const PeregrineMessage *pg_msg = static_cast<const PeregrineMessage*>(pg_zmq_msg.data());
+
+    std::string data_str;
+    if (pg_zmq_msg.size() > sizeof(PeregrineMessage)) {
+      size_t data_str_size = pg_zmq_msg.size() - sizeof(PeregrineMessage);
+      data_str.resize(data_str_size);
+      std::memcpy(data_str.data(), (char *) pg_zmq_msg.data() + sizeof(PeregrineMessage), data_str_size);
+    }
+
+    // envelope delimiter
+    multi_msg.remove();
+
+    // identity
+    std::string worker_id = multi_msg.remove().to_string();
+
+    return std::tuple(*pg_msg, data_str, worker_id);
+  }
+
+  std::pair<struct PeregrineMessage, std::string>
+  get_pg_msg_and_data(
+      const Worker &worker
+  )
+  {
+    zmq::multipart_t multi_msg(*worker.sock);
+    const auto &pg_zmq_msg = multi_msg.back();
+    const PeregrineMessage *pg_msg = static_cast<const PeregrineMessage*>(pg_zmq_msg.data());
+
+    std::string data_str;
+    if (pg_zmq_msg.size() > sizeof(PeregrineMessage)) {
+      size_t data_str_size = pg_zmq_msg.size() - sizeof(PeregrineMessage);
+      data_str.resize(data_str_size);
+      std::memcpy(data_str.data(), (char *) pg_zmq_msg.data() + sizeof(PeregrineMessage), data_str_size);
+    }
+
+    return std::pair(*pg_msg, data_str);
+  }
+
+  enum WorkType
+  get_work_type(
+      const Worker &worker
+  )
+  {
+    zmq::multipart_t multi_msg(*worker.sock);
+    const auto &worktype_zmq_msg = multi_msg.back();
+    const PeregrineMessage *pg_msg = static_cast<const PeregrineMessage*>(worktype_zmq_msg.data());
+    if (pg_msg->msg_type != MessageType::WorkType) {
+      return static_cast<enum WorkType>(-1);
+    }
+
+    return pg_msg->msg.work_type_msg.work_type;
+  }
+
+  std::vector<std::pair<SmallGraph, uint64_t>>
+  count_distributed(
+      Master &master,
+      const std::vector<SmallGraph> &patterns
   )
   {
     // initialize
-    if (patterns.empty()) return;
+    std::vector<std::pair<SmallGraph, uint64_t>> results;
+    if (patterns.empty()) return results;
+
+    DataGraph *dg = master.data_graph.get();
+
+    // optimize if all unlabelled vertex-induced patterns of a certain size
+    // TODO: if a subset is all unlabelled vertex-induced patterns of a certain
+    // size it can be optimized too
+    uint32_t sz = patterns.front().num_vertices();
+    auto is_same_size = [&sz](const SmallGraph &p) {
+        return p.num_vertices() == sz && p.num_anti_vertices() == 0;
+      };
+    auto is_vinduced = [](const SmallGraph &p) {
+        uint32_t m = p.num_anti_edges() + p.num_true_edges();
+        uint32_t n = p.num_vertices();
+        return m == (n*(n-1))/2;
+      };
+    uint32_t num_possible_topologies[] = {
+      0,
+      1,
+      1,
+      2, // size 3
+      6, // size 4
+      21, // size 5
+      112, // size 6
+      853, // size 7
+      11117, // size 8
+      261080, // size 9
+    };
+
+    bool must_convert_counts = false;
+    std::vector<SmallGraph> new_patterns;
+    if (std::all_of(patterns.cbegin(), patterns.cend(), is_same_size)
+        && std::all_of(patterns.cbegin(), patterns.cend(), is_vinduced)
+        && (sz < 10 && patterns.size() == num_possible_topologies[sz]))
+    {
+      must_convert_counts = true;
+      new_patterns = PatternGenerator::all(sz, PatternGenerator::VERTEX_BASED, PatternGenerator::EXCLUDE_ANTI_EDGES);
+    }
+    else
+    {
+      new_patterns.assign(patterns.cbegin(), patterns.cend());
+    }
+
+    send_patterns_to_workers(master, patterns);
+
+    send_work_type_to_workers(master, WorkType::Count);
+
     std::vector<uint64_t> results_map(new_patterns.size(), 0);
 
     utils::Log{} << "---- MASTER ----\n";
-
-    zmq::context_t ctx;
-
-    auto master_sock_pair = create_master_sockets(ctx, nworkers);
-    auto master_pull_sock = std::move(master_sock_pair.first);
-    auto master_push_sock = std::move(master_sock_pair.second);
 
     auto t1 = utils::get_timestamp();
     // send tasks now that workers are ready
     uint64_t tasks_sent = 0;
     uint64_t tasks_completed = 0;
-    for (uint32_t i = 0; i < (uint32_t) new_patterns.size(); i++) {
-      AnalyzedPattern ap(new_patterns[i]);
-      uint32_t vgs_count = ap.vgs.size();
-      uint32_t num_vertices = dg->get_vertex_count();
-      uint64_t num_tasks = vgs_count * num_vertices;
-      uint64_t num_tasks_per_item = 1024;
 
-      uint64_t task_item_start = 0;
-      while (task_item_start < num_tasks) {
-        send_task_msg(*master_push_sock, task_item_start, std::min(task_item_start + num_tasks_per_item, num_tasks + 1), tasks_sent, i);
-        tasks_sent++;
+    TaskIterator task_it(*dg, patterns);
+    auto curr_task_it = task_it.begin();
+    uint32_t num_active_tasks_per_worker = 3;
+    size_t num_workers = master.worker_ids.size();
+    while (tasks_completed < tasks_sent || !curr_task_it.end) {
+        std::string worker_id;
+        if (tasks_sent < num_workers * num_active_tasks_per_worker) {
+          worker_id = master.worker_ids[tasks_sent % num_workers];
+        } else {
+          auto [pg_msg, data, msg_worker_id] = get_pg_msg_data_and_id(master);
+          worker_id = msg_worker_id;
+          results_map[pg_msg.msg.comp_c_task.pattern_idx] += pg_msg.msg.comp_c_task.count;
+          
+          tasks_completed++;
+        }
+        
+        if (!curr_task_it.end) {
+          send_task_msg(*master.sock, worker_id, *curr_task_it);
 
-        task_item_start += num_tasks_per_item;
-      }
+          ++curr_task_it;
+          ++tasks_sent;
+        }
     }
 
-    utils::Log{} << "master done sending tasks\n";
-
-    zmq::message_t task_complete_msg;
-    while (tasks_completed < tasks_sent && master_pull_sock->recv(task_complete_msg, zmq::recv_flags::none).has_value()) {
-      struct PeregrineMessage *task_complete_pg_msg = static_cast<struct PeregrineMessage *>(task_complete_msg.data());
-      results_map[task_complete_pg_msg->msg.comp_c_task.pattern_idx] += task_complete_pg_msg->msg.comp_c_task.count;
-
-      tasks_completed++;
-    }
     utils::Log{} << "master done receiving tasks\n";
 
     for (size_t i = 0; i < new_patterns.size(); i++) {
@@ -660,12 +959,12 @@ namespace Peregrine
     auto t2 = utils::get_timestamp();
 
     // tell all workers that job is done
-    stop_workers(*master_pull_sock, *master_push_sock, nworkers);
+    stop_workers(master);
 
     utils::Log{} << "-------" << "\n";
     utils::Log{} << "master all patterns finished after " << (t2-t1)/1e6 << "s" << "\n";
 
-    return;
+    return results;
   }
 
   void count_worker_parallel(unsigned tid, DataGraph *dg, Barrier &b)
@@ -2148,7 +2447,7 @@ namespace Peregrine
     return results;
   }
 
-  zmq::send_result_t
+  bool
   send_task_complete_msg(zmq::socket_t &socket, struct Task *task, uint64_t count)
   {
     struct CompletedCountTask completed_task = {
@@ -2162,80 +2461,23 @@ namespace Peregrine
     };
     pg_completed_task_msg.msg.comp_c_task = completed_task;
 
+    zmq::multipart_t multi_zmq_msg;
+    multi_zmq_msg.addstr("");
+
     zmq::message_t zmq_msg(&pg_completed_task_msg, sizeof(pg_completed_task_msg));
-    return socket.send(zmq_msg, zmq::send_flags::dontwait);
+    multi_zmq_msg.add(std::move(zmq_msg));
+    return multi_zmq_msg.send(socket, 0);
   }
 
-  template <typename DataGraphT>
-  std::vector<std::pair<SmallGraph, uint64_t>>
-  count_parallel(DataGraphT &&data_graph, const std::vector<SmallGraph> &patterns, size_t nthreads, bool is_master, size_t nworkers, std::string master_host)
+  void
+  count_distributed_worker(struct Worker& worker, DataGraph &dg, const std::vector<SmallGraph> &patterns)
   {
-    // initialize
-    std::vector<std::pair<SmallGraph, uint64_t>> results;
-    if (patterns.empty()) return results;
-
-    // optimize if all unlabelled vertex-induced patterns of a certain size
-    // TODO: if a subset is all unlabelled vertex-induced patterns of a certain
-    // size it can be optimized too
-    uint32_t sz = patterns.front().num_vertices();
-    auto is_same_size = [&sz](const SmallGraph &p) {
-        return p.num_vertices() == sz && p.num_anti_vertices() == 0;
-      };
-    auto is_vinduced = [](const SmallGraph &p) {
-        uint32_t m = p.num_anti_edges() + p.num_true_edges();
-        uint32_t n = p.num_vertices();
-        return m == (n*(n-1))/2;
-      };
-    uint32_t num_possible_topologies[] = {
-      0,
-      1,
-      1,
-      2, // size 3
-      6, // size 4
-      21, // size 5
-      112, // size 6
-      853, // size 7
-      11117, // size 8
-      261080, // size 9
-    };
-
-    bool must_convert_counts = false;
-    std::vector<SmallGraph> new_patterns;
-    if (std::all_of(patterns.cbegin(), patterns.cend(), is_same_size)
-        && std::all_of(patterns.cbegin(), patterns.cend(), is_vinduced)
-        && (sz < 10 && patterns.size() == num_possible_topologies[sz]))
-    {
-      must_convert_counts = true;
-      new_patterns = PatternGenerator::all(sz, PatternGenerator::VERTEX_BASED, PatternGenerator::EXCLUDE_ANTI_EDGES);
-    }
-    else
-    {
-      new_patterns.assign(patterns.cbegin(), patterns.cend());
-    }
-
-    Barrier barrier(nthreads);
-    std::thread master;
+    Barrier barrier(worker.nthreads);
     std::vector<std::thread> pool;
-    DataGraph dg(data_graph);
-    dg.set_rbi(new_patterns.front());
+    dg.set_rbi(patterns.front());
+    dg.set_known_labels(patterns);
 
-    utils::Log{} << "Finished reading datagraph: |V| = " << dg.get_vertex_count()
-              << " |E| = " << dg.get_edge_count()
-              << "\n";
-
-    dg.set_known_labels(new_patterns);
-
-    zmq::context_t ctx;
-
-    auto worker_sock_pair = create_worker_sockets(ctx, master_host);
-    auto worker_pull_sock = std::move(worker_sock_pair.first);
-    auto worker_push_sock = std::move(worker_sock_pair.second);
-
-    if (is_master) {
-      master = std::thread(count_master, &dg, std::ref(patterns), std::ref(new_patterns), nworkers, must_convert_counts, std::ref(results)); 
-    }
-
-    for (uint8_t i = 0; i < nthreads; ++i)
+    for (uint8_t i = 0; i < worker.nthreads; ++i)
     {
       pool.emplace_back(count_worker_parallel,
           i,
@@ -2248,22 +2490,20 @@ namespace Peregrine
 
     utils::timestamp_t working_t_sum = 0;
     auto t1 = utils::get_timestamp();
-    zmq::message_t task_msg;
     uint64_t worker_tasks_completed = 0;
-    while (worker_pull_sock->recv(task_msg, zmq::recv_flags::none).has_value()) {
-      struct PeregrineMessage *task_pg_msg = static_cast<struct PeregrineMessage *>(task_msg.data());
-      if (task_pg_msg->msg_type == MessageType::JobDone) {
-        worker_push_sock->send(task_msg, zmq::send_flags::none);
+    for (;;) {
+      auto [task_pg_msg, data] = get_pg_msg_and_data(worker);
+      if (task_pg_msg.msg_type == MessageType::JobDone) {
         break;
       }
 
       auto working_t1 = utils::get_timestamp();
       Context::gcount = 0;
 
-      Context::task_ctr = task_pg_msg->msg.task.start_task;
-      Context::task_end = task_pg_msg->msg.task.end_task;
-      Context::pattern_idx = task_pg_msg->msg.task.pattern_idx;
-      dg.set_rbi(new_patterns[Context::pattern_idx]);
+      Context::task_ctr = task_pg_msg.msg.task.start_task;
+      Context::task_end = task_pg_msg.msg.task.end_task;
+      Context::pattern_idx = task_pg_msg.msg.task.pattern_idx;
+      dg.set_rbi(patterns[Context::pattern_idx]);
 
       barrier.release();
 
@@ -2273,14 +2513,11 @@ namespace Peregrine
       auto working_t2 = utils::get_timestamp();
       working_t_sum += (working_t2 - working_t1);
 
-      send_task_complete_msg(*worker_push_sock, &task_pg_msg->msg.task, global_count);
+      send_task_complete_msg(*worker.sock, &task_pg_msg.msg.task, global_count);
       worker_tasks_completed++;
     }
     utils::Log{} << "worker is done all tasks in queue after completing " << worker_tasks_completed << " tasks (" << working_t_sum/1e6 << "s of working time)\n";
 
-    if (is_master) {
-      master.join();
-    }
     auto t2 = utils::get_timestamp();
 
     barrier.finish();
@@ -2292,7 +2529,7 @@ namespace Peregrine
     utils::Log{} << "-------" << "\n";
     utils::Log{} << "all patterns finished after " << (t2-t1)/1e6 << "s" << "\n";
 
-    return results;
+    return;
   }
 
   template <typename DataGraphT>
@@ -2404,6 +2641,84 @@ namespace Peregrine
 
 
     return results;
+  }
+
+  template <typename DataGraphT>
+  void
+  start_worker(DataGraphT &&data_graph, size_t nthreads, std::string master_host)
+  {
+    struct Worker worker;
+    DataGraph dg(data_graph);
+    utils::Log{} << "Finished reading datagraph: |V| = " << dg.get_vertex_count()
+              << " |E| = " << dg.get_edge_count()
+              << "\n";
+
+    zmq::context_t ctx;
+    worker.context = std::move(ctx);
+    worker.nthreads = nthreads;
+
+    worker.sock = std::make_unique<zmq::socket_t>(worker.context, zmq::socket_type::dealer);
+    worker.sock->set(zmq::sockopt::linger, 0);
+
+    worker.sock->connect("tcp://127.0.0.1:9999");
+
+    zmq::multipart_t ready_msg;
+    ready_msg.pushstr("");
+    ready_msg.pushstr("ready");
+    const auto res = ready_msg.send(*worker.sock, 0);
+    if (res) {
+      utils::Log{} << "Worker is ready. Waiting for tasks from master...\n";
+    }
+
+    std::vector<SmallGraph> patterns;
+    for (;;) {
+      auto [pg_msg, data_str] = get_pg_msg_and_data(worker);
+      if (pg_msg.msg_type == MessageType::Patterns) {
+        patterns = read_patterns(data_str);
+      } else if (pg_msg.msg_type == MessageType::WorkType) {
+        enum WorkType work_type = pg_msg.msg.work_type_msg.work_type;
+        if (work_type == WorkType::Count) {
+          count_distributed_worker(worker, dg, patterns);
+        }
+      } else {
+        utils::Log{} << "Worker received unexepected message of type " << pg_msg.msg_type << "\n";
+      }
+    }
+    return;
+  }
+
+  struct Master
+  create_master(size_t nworkers)
+  {
+    struct Master master;
+
+    zmq::context_t ctx;
+    master.context = std::move(ctx);
+    master.nworkers = nworkers;
+    master.data_graph = std::make_unique<DataGraph>("data/citeseer");
+
+    // TODO: set number of threads for master
+    // TODO: set data_graph_name
+
+    master.sock = std::make_unique<zmq::socket_t>(master.context, zmq::socket_type::router);
+    master.sock->set(zmq::sockopt::linger, 0);
+    master.sock->set(zmq::sockopt::router_mandatory, 1);
+
+    master.sock->bind("tcp://*:9999");
+
+    uint32_t num_workers_ready = 0;
+    utils::Log{} << "Waiting for all workers to become ready...\n";
+    while (num_workers_ready < nworkers) {
+      zmq::multipart_t ready_msg;
+      const auto res = ready_msg.recv(*master.sock, 0);
+      if (res) {
+        std::string identity = ready_msg.popstr();
+        master.worker_ids.push_back(identity);
+        num_workers_ready++;
+        utils::Log{} << "[" << num_workers_ready << "/" << nworkers << "] workers are ready" << "\n";
+      }
+    }
+    return master;
   }
 } // namespace Peregrine
 

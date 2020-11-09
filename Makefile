@@ -1,6 +1,6 @@
 ROOT_DIR:=$(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 LDFLAGS=-L $(ROOT_DIR)/core/bliss-0.73/ -lbliss -L/usr/local/lib -lpthread -latomic -L$(LD_LIBRARY_PATH) -ltbb -lzmq
-CFLAGS=-O3 -std=c++2a -Wall -Wextra -Wpedantic -fPIC -fconcepts -I$(ROOT_DIR)/core/
+CFLAGS=-g -O0 -std=c++2a -Wall -Wextra -Wpedantic -fPIC -fconcepts -I$(ROOT_DIR)/core/
 OBJ=core/DataGraph.o core/PO.o core/utils.o core/PatternGenerator.o $(ROOT_DIR)/core/showg.o
 OUTDIR=bin/
 CC=g++
@@ -12,6 +12,12 @@ core/roaring.o: core/roaring/roaring.c
 
 %.o: %.cc
 	$(CC) -c $? -o $@ $(CFLAGS)
+
+worker: apps/worker.cc $(OBJ) core/roaring.o bliss
+	$(CC) apps/worker.cc $(OBJ) core/roaring.o -o $(OUTDIR)/$@ $(LDFLAGS) $(CFLAGS)
+
+count_master: apps/count_master.cc $(OBJ) core/roaring.o bliss
+	$(CC) apps/count_master.cc $(OBJ) core/roaring.o -o $(OUTDIR)/$@ $(LDFLAGS) $(CFLAGS)
 
 fsm-single: apps/fsm-single.cc $(OBJ) core/roaring.o bliss
 	$(CC) apps/fsm-single.cc $(OBJ) core/roaring.o -o $(OUTDIR)/$@ $(LDFLAGS) $(CFLAGS)

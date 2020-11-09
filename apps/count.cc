@@ -50,20 +50,12 @@ int main(int argc, char *argv[])
   std::vector<std::pair<Peregrine::SmallGraph, uint64_t>> result;
   if (is_directory(data_graph_name))
   {
-    if (is_parallel) {
-      result = Peregrine::count_parallel(data_graph_name, patterns, nthreads, is_master, num_workers, master_host);
-    } else {
-      result = Peregrine::count(data_graph_name, patterns, nthreads);
-    }
+    result = Peregrine::count(data_graph_name, patterns, nthreads);
   }
   else
   {
     Peregrine::SmallGraph G(data_graph_name);
-    if (is_parallel) {
-      result = Peregrine::count_parallel(G, patterns, nthreads, is_master, num_workers, master_host);
-    } else {
-      result = Peregrine::count(G, patterns, nthreads);
-    }
+    result = Peregrine::count(G, patterns, nthreads);
   }
 
   for (const auto &[p, v] : result)

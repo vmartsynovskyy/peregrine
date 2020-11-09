@@ -10,6 +10,9 @@
 #include <iterator>
 #include <queue>
 #include <cmath>
+#include <cereal/archives/binary.hpp>
+#include <cereal/types/vector.hpp>
+#include <cereal/types/unordered_map.hpp>
 #include "PO.hh"
 #include "utils.hh"
 #include "./bliss-0.73/graph.hh"
@@ -349,7 +352,12 @@ namespace Peregrine
 
       SmallGraph(std::string inputfile)
       {
-          std::ifstream query_graph(inputfile.c_str());
+        std::ifstream inputfile_stream(inputfile.c_str());
+        init(inputfile_stream);
+      }
+
+      void init(std::istream &query_graph)
+      {
           std::string line;
           while (std::getline(query_graph, line))
           {
@@ -390,7 +398,7 @@ namespace Peregrine
           }
 
           if (num_vertices() == 0) {
-            throw std::invalid_argument("Found 0 vertices in file '" + inputfile + "'");
+            throw std::invalid_argument("Found 0 vertices while constructing SmallGraph");
           }
 
           // check if labelled or partially labelled
@@ -401,6 +409,12 @@ namespace Peregrine
 
           // make sure anti_adj_list.at() doesn't fail
           for (uint32_t v = 1; v <= num_vertices(); ++v) anti_adj_list[v];
+      }
+
+      template<class Archive>
+      void serialize(Archive &archive)
+      { 
+        archive(true_adj_list, anti_adj_list, labels, labelling);
       }
 
       /**

@@ -8,6 +8,17 @@ enum MessageType : uint32_t {
   CompletedCountTask,
   CompletedMatchTask,
   JobDone,
+  Patterns,
+  WorkType,
+  StopWorker,
+};
+
+enum WorkType : uint32_t {
+  Count = 0,
+};
+
+struct WorkTypeMessage {
+  enum WorkType work_type;
 };
 
 struct Task {
@@ -34,6 +45,7 @@ struct PeregrineMessage {
     struct Task task;
     struct CompletedMatchTask comp_m_task;
     struct CompletedCountTask comp_c_task;
+    struct WorkTypeMessage work_type_msg;
   } msg;
 };
 
