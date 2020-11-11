@@ -17,17 +17,13 @@ int main(int argc, char *argv[])
 {
   if (argc < 3)
   {
-    std::cerr << "USAGE: " << argv[0] << " <data graph> <pattern | #-motifs | #-clique> <# threads> <master|hostname-of-master for workers> [# workers]" << std::endl;
+    std::cerr << "USAGE: " << argv[0] << " <data graph> <pattern | #-motifs | #-clique> [# threads]" << std::endl;
     return -1;
   }
 
   const std::string data_graph_name(argv[1]);
   const std::string pattern_name(argv[2]);
-  size_t nthreads = std::stoi(argv[3]);
-  bool is_parallel = argc > 4;
-  bool is_master = is_parallel ? std::string(argv[4]) == "master" : false;
-  std::string master_host = !is_master && argc > 4 ? std::string(argv[4]) : "127.0.0.1";
-  size_t num_workers = argc > 5 ? std::stoi(argv[5]) : 1;
+  size_t nthreads = argc < 4 ? 1 : std::stoi(argv[3]);
 
   std::vector<Peregrine::SmallGraph> patterns;
   if (auto end = pattern_name.rfind("motifs"); end != std::string::npos)
