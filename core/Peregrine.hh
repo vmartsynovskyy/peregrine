@@ -165,11 +165,6 @@ namespace Peregrine
 
       iterator& operator++()
       {
-        AnalyzedPattern ap(patterns[pattern_idx]);
-        uint32_t vgs_count = ap.vgs.size();
-        uint32_t num_vertices = dg.get_vertex_count();
-        uint64_t num_tasks = vgs_count * num_vertices;
-
         curr_task_id++;
         task_item_start += num_tasks_per_item;
         if (task_item_start > num_tasks) {
@@ -909,7 +904,7 @@ namespace Peregrine
       new_patterns.assign(patterns.cbegin(), patterns.cend());
     }
 
-    send_patterns_to_workers(master, patterns);
+    send_patterns_to_workers(master, new_patterns);
 
     send_work_type_to_workers(master, WorkType::Count);
 
@@ -922,7 +917,7 @@ namespace Peregrine
     uint64_t tasks_sent = 0;
     uint64_t tasks_completed = 0;
 
-    TaskIterator task_it(*dg, patterns);
+    TaskIterator task_it(*dg, new_patterns);
     auto curr_task_it = task_it.begin();
     uint32_t num_active_tasks_per_worker = 3;
     size_t num_workers = master.worker_ids.size();
