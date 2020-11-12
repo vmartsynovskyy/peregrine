@@ -13,12 +13,34 @@ enum MessageType : uint32_t {
   StopWorker,
 };
 
-enum WorkType : uint32_t {
+enum PgWorkType : uint32_t {
   Count = 0,
+  MatchSingle,
+  MatchVector,
+  MatchMulti,
+};
+
+enum AggKeyType : uint32_t {
+  Pattern = 0,
+};
+
+enum AggValueType : uint32_t {
+  Bool = 0,
+  Domain,
+  DiscoveryDomain,
+};
+
+enum ProcessFunc : uint32_t {
+  FirstFsm = 0,
+  SecondFsm,
+  Existence,
 };
 
 struct WorkTypeMessage {
-  enum WorkType work_type;
+  PgWorkType work_type;
+  AggKeyType agg_key_type;
+  AggValueType agg_value_type;
+  uint32_t process_func_idx = 0;
 };
 
 struct Task {
