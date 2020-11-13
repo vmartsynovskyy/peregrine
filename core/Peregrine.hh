@@ -231,10 +231,14 @@ namespace Peregrine
   {
     trivial_wrapper() : val() {}
     // add always_true to prevent overload collision with other constructor
-    trivial_wrapper(size_t num_sets, bool always_true) : val() {}
+    trivial_wrapper(size_t num_sets, bool always_true) : val() {
+      (void) num_sets;
+      (void) always_true;
+    }
     trivial_wrapper(T v) : val(v) {}
     trivial_wrapper(char* buf, size_t n)
     {
+      (void) n;
       memcpy(&val, buf, sizeof(val));
     }
 
@@ -555,8 +559,10 @@ namespace Peregrine
       struct PeregrineMessage worktype_pg_msg{};
       worktype_pg_msg.msg_type = MessageType::WorkType;
 
-      struct WorkTypeMessage worktype_msg{
-        .work_type = work_type,
+      struct WorkTypeMessage worktype_msg {
+        .work_type      = work_type,
+        .agg_key_type   = AggKeyType::Pattern,
+        .agg_value_type = AggValueType::Bool,
       };
 
       if constexpr (std::is_same<AggKeyT, Peregrine::Pattern>()) {
@@ -1202,8 +1208,6 @@ namespace Peregrine
 
   template <typename T>
   T default_viewer(T &&v) { return v; }
-  template <typename T>
-  T null_viewer(T v) { return v; }
 
   template <
     typename AggKeyT,
@@ -1428,9 +1432,9 @@ namespace Peregrine
     return results;
   }
 
-  template <typename AggKeyT, typename AggValueT>
+  template <typename AggContainerT>
   bool
-  send_match_task_complete_msg(zmq::socket_t &socket, struct Task &task, std::unordered_map<AggKeyT, AggValueT> &agg_value)
+  send_match_task_complete_msg(zmq::socket_t &socket, const struct Task &task, const AggContainerT &agg_value)
   {
     struct CompletedMatchTask completed_task = {
       .task_id      = task.task_id,
@@ -1459,158 +1463,6 @@ namespace Peregrine
     multi_zmq_msg.addstr("");
     multi_zmq_msg.add(std::move(zmq_msg));
     return multi_zmq_msg.send(socket, 0);
-  }
-
-  template <typename AggValueT>
-  bool
-  send_match_task_complete_msg(zmq::socket_t &socket, struct Task &task, std::vector<AggValueT> &agg_value)
-  {
-    struct CompletedMatchTask completed_task = {
-      .task_id      = task.task_id,
-      .pattern_idx  = task.pattern_idx,
-    };
-    struct PeregrineMessage pg_completed_task_msg = {
-      .msg_type = MessageType::CompletedMatchTask,
-      .msg      = {},
-    };
-    pg_completed_task_msg.msg.comp_m_task = completed_task;
-
-    std::stringstream ss;
-    {
-      cereal::BinaryOutputArchive archive(ss);
-
-      archive(agg_value);
-    }
-    auto serial_data = ss.str();
-    zmq::message_t zmq_msg(sizeof(pg_completed_task_msg) + serial_data.length());
-    char *msg_buff = static_cast<char*>(zmq_msg.data());
-    std::memcpy(msg_buff, &pg_completed_task_msg, sizeof(pg_completed_task_msg));
-    std::memcpy(msg_buff + sizeof(pg_completed_task_msg), serial_data.data(), serial_data.size());
-
-    zmq::multipart_t multi_zmq_msg;
-    multi_zmq_msg.addstr("");
-    multi_zmq_msg.add(std::move(zmq_msg));
-    return multi_zmq_msg.send(socket, 0);
-  }
-
-  template <typename AggValueT>
-  bool
-  send_match_task_complete_msg(zmq::socket_t &socket, struct Task &task, AggValueT &agg_value)
-  {
-    struct CompletedMatchTask completed_task = {
-      .task_id      = task.task_id,
-      .pattern_idx  = task.pattern_idx,
-    };
-    struct PeregrineMessage pg_completed_task_msg = {
-      .msg_type = MessageType::CompletedMatchTask,
-      .msg      = {},
-    };
-    pg_completed_task_msg.msg.comp_m_task = completed_task;
-
-    std::stringstream ss;
-    {
-      cereal::BinaryOutputArchive archive(ss);
-
-      archive(agg_value);
-    }
-    auto serial_data = ss.str();
-    zmq::message_t zmq_msg(sizeof(pg_completed_task_msg) + serial_data.length());
-    char *msg_buff = static_cast<char*>(zmq_msg.data());
-    std::memcpy(msg_buff, &pg_completed_task_msg, sizeof(pg_completed_task_msg));
-    std::memcpy(msg_buff + sizeof(pg_completed_task_msg), serial_data.data(), serial_data.size());
-
-    zmq::multipart_t multi_zmq_msg;
-    multi_zmq_msg.addstr("");
-    multi_zmq_msg.add(std::move(zmq_msg));
-    return multi_zmq_msg.send(socket, 0);
-  }
-
-
-  template <typename AggKeyT,
-           typename AggValueT,
-           typename PF,
-           typename VF>
-  void
-  match_multi_distributed_worker(
-      struct Worker& worker,
-      DataGraph &dg,
-      const std::vector<SmallGraph> &patterns,
-      PF &&process,
-      VF &&viewer)
-  {
-    // initialize
-    Barrier barrier(worker.nthreads);
-    std::vector<std::thread> pool;
-    dg.set_rbi(patterns.front());
-
-    MapAggregator<AggKeyT, AggValueT, Peregrine::AT_THE_END, Peregrine::UNSTOPPABLE, decltype(viewer)> aggregator(worker.nthreads, viewer);
-
-    for (uint8_t i = 0; i < worker.nthreads; ++i)
-    {
-      pool.emplace_back(map_worker_parallel<
-            AggKeyT,
-            AggValueT,
-            decltype(aggregator),
-            PF
-          >,
-          i,
-          &dg,
-          std::ref(barrier),
-          std::ref(aggregator),
-          std::ref(process));
-    }
-
-    // make sure the threads are all running
-    barrier.join();
-
-    utils::timestamp_t working_t_sum = 0;
-    auto t1 = utils::get_timestamp();
-    uint64_t worker_tasks_completed = 0;
-    for (;;) {
-      auto [task_pg_msg, data] = get_pg_msg_and_data(worker);
-      if (task_pg_msg.msg_type == MessageType::JobDone) {
-        break;
-      }
-
-      auto working_t1 = utils::get_timestamp();
-
-      // reset state
-      Context::task_ctr = task_pg_msg.msg.task.start_task;
-      Context::task_end = task_pg_msg.msg.task.end_task;
-
-      // set new pattern
-      Context::pattern_idx = task_pg_msg.msg.task.pattern_idx;
-      dg.set_rbi(patterns[Context::pattern_idx]);
-      Context::current_pattern = std::make_shared<AnalyzedPattern>(AnalyzedPattern(dg.rbi));
-
-      // prepare handles for the next pattern
-      aggregator.reset();
-
-      barrier.release();
-
-      barrier.join();
-
-      // get thread-local values
-      aggregator.get_result();
-
-      auto working_t2 = utils::get_timestamp();
-      working_t_sum += (working_t2 - working_t1);
-
-      send_match_task_complete_msg(*worker.sock, task_pg_msg.msg.task, aggregator.global);
-      worker_tasks_completed++;
-    }
-    auto t2 = utils::get_timestamp();
-
-    barrier.finish();
-    for (auto &th : pool)
-    {
-      th.join();
-    }
-
-    utils::Log{} << "-------" << "\n";
-    utils::Log{} << "all patterns finished after " << (t2-t1)/1e6 << "s" << "\n";
-
-    return;
   }
 
   template <typename AggValueT, typename VF>
@@ -1861,91 +1713,6 @@ namespace Peregrine
     return multi_zmq_msg.send(socket, 0);
   }
 
-  template <typename AggValueT,
-            typename PF,
-            typename VF>
-  void
-  match_single_distributed_worker(
-      struct Worker& worker,
-      DataGraph &dg,
-      const std::vector<SmallGraph> &patterns,
-      PF &&process,
-      VF &&viewer)
-  {
-    // initialize
-    Barrier barrier(worker.nthreads);
-    std::vector<std::thread> pool;
-    dg.set_rbi(patterns.front());
-
-    SVAggregator<AggValueT, Peregrine::AT_THE_END, Peregrine::UNSTOPPABLE, decltype(viewer)> aggregator(worker.nthreads, viewer);
-
-    for (uint8_t i = 0; i < worker.nthreads; ++i)
-    {
-      pool.emplace_back(single_worker_parallel<
-            AggValueT,
-            decltype(aggregator),
-            PF
-          >,
-          i,
-          &dg,
-          std::ref(barrier),
-          std::ref(aggregator),
-          std::ref(process));
-    }
-
-    // make sure the threads are all running
-    barrier.join();
-
-    utils::timestamp_t working_t_sum = 0;
-    auto t1 = utils::get_timestamp();
-    uint64_t worker_tasks_completed = 0;
-    for (;;) {
-      auto [task_pg_msg, data] = get_pg_msg_and_data(worker);
-      if (task_pg_msg.msg_type == MessageType::JobDone) {
-        break;
-      }
-
-      auto working_t1 = utils::get_timestamp();
-
-      // reset state
-      Context::task_ctr = task_pg_msg.msg.task.start_task;
-      Context::task_end = task_pg_msg.msg.task.end_task;
-
-      // set new pattern
-      Context::pattern_idx = task_pg_msg.msg.task.pattern_idx;
-      dg.set_rbi(patterns[Context::pattern_idx]);
-      Context::current_pattern = std::make_shared<AnalyzedPattern>(AnalyzedPattern(dg.rbi));
-
-      // prepare handles for the next pattern
-      aggregator.reset();
-
-      barrier.release();
-
-      barrier.join();
-
-      // get thread-local values
-      aggregator.get_result();
-
-      auto working_t2 = utils::get_timestamp();
-      working_t_sum += (working_t2 - working_t1);
-
-      send_match_task_complete_msg(*worker.sock, task_pg_msg.msg.task, aggregator.global);
-      worker_tasks_completed++;
-    }
-    auto t2 = utils::get_timestamp();
-
-    barrier.finish();
-    for (auto &th : pool)
-    {
-      th.join();
-    }
-
-    utils::Log{} << "-------" << "\n";
-    utils::Log{} << "all patterns finished after " << (t2-t1)/1e6 << "s" << "\n";
-
-    return;
-  }
-
   template <typename AggValueT, typename VF>
   std::vector<std::pair<SmallGraph, decltype(std::declval<VF>()(std::declval<AggValueT>()))>>
   match_single_distributed(
@@ -2023,9 +1790,9 @@ namespace Peregrine
     return results;
   }
 
-  template <typename AggValueT, typename PF, typename VF>
+  template <typename AggValueT, typename AggregatorT, typename AggKeyT = Peregrine::Pattern, typename PF, typename VF>
   void
-  match_vector_distributed_worker(
+  match_aggregator_distributed_worker(
       struct Worker& worker,
       DataGraph &dg,
       const std::vector<SmallGraph> &patterns,
@@ -2037,20 +1804,46 @@ namespace Peregrine
     std::vector<std::thread> pool;
     dg.set_rbi(patterns.front());
 
-    VecAggregator<AggValueT, Peregrine::AT_THE_END, Peregrine::UNSTOPPABLE, decltype(viewer)> aggregator(worker.nthreads, viewer);
+    AggregatorT aggregator(worker.nthreads, viewer);
 
     for (uint8_t i = 0; i < worker.nthreads; ++i)
     {
-      pool.emplace_back(vector_worker_parallel<
-            AggValueT,
-            decltype(aggregator),
-            PF
-          >,
-          i,
-          &dg,
-          std::ref(barrier),
-          std::ref(aggregator),
-          std::ref(process));
+      using AggGlobalT = decltype(aggregator.global);
+      if constexpr (std::is_same<AggGlobalT, std::vector<AggValueT>>()) {
+        pool.emplace_back(vector_worker_parallel<
+              AggValueT,
+              decltype(aggregator),
+              PF
+            >,
+            i,
+            &dg,
+            std::ref(barrier),
+            std::ref(aggregator),
+            std::ref(process));
+      } else if constexpr(std::is_same<AggGlobalT, AggValueT>()) {
+        pool.emplace_back(single_worker_parallel<
+              AggValueT,
+              decltype(aggregator),
+              PF
+            >,
+            i,
+            &dg,
+            std::ref(barrier),
+            std::ref(aggregator),
+            std::ref(process));
+      } else if constexpr(std::is_same<AggGlobalT, std::unordered_map<AggKeyT, AggValueT>>()) {
+        pool.emplace_back(map_worker_parallel<
+              AggKeyT,
+              AggValueT,
+              decltype(aggregator),
+              PF
+            >,
+            i,
+            &dg,
+            std::ref(barrier),
+            std::ref(aggregator),
+            std::ref(process));
+      }
     }
 
     // make sure the threads are all running
@@ -2580,7 +2373,7 @@ namespace Peregrine
     }
     else
     {
-      return match_multi_parallel<AggKeyT, AggValueT>(master, view, patterns);
+      return match_multi_distributed<AggKeyT, AggValueT>(master, view, patterns);
     }
   }
 
@@ -2603,17 +2396,23 @@ namespace Peregrine
         };
         const auto process = Context::processExistence;
 
-        match_single_distributed_worker<trivial_wrapper<bool>>(worker, dg, patterns, process, view);
+        using AggValueT = trivial_wrapper<bool>;
+        using AggregatorT = SVAggregator<AggValueT, Peregrine::AT_THE_END, Peregrine::UNSTOPPABLE, decltype(view)>;
+        match_aggregator_distributed_worker<AggValueT, AggregatorT>(worker, dg, patterns, process, view);
       } else if (work_type_msg.agg_value_type == AggValueType::Domain) {
         const auto view = [](auto &&v) { return v.get_support(); };
         const auto process = Context::processSecondFsm;
 
-        match_single_distributed_worker<struct Domain>(worker, dg, patterns, process, view);
+        using AggValueT = struct Domain;
+        using AggregatorT = SVAggregator<AggValueT, Peregrine::AT_THE_END, Peregrine::UNSTOPPABLE, decltype(view)>;
+        match_aggregator_distributed_worker<AggValueT, AggregatorT>(worker, dg, patterns, process, view);
       } else if (work_type_msg.agg_value_type == AggValueType::DiscoveryDomain) {
         const auto view = [](auto &&v) { return v.get_support(); };
         const auto process = Context::processFirstFsm;
 
-        match_single_distributed_worker<struct DiscoveryDomain>(worker, dg, patterns, process, view);
+        using AggValueT = struct DiscoveryDomain;
+        using AggregatorT = SVAggregator<AggValueT, Peregrine::AT_THE_END, Peregrine::UNSTOPPABLE, decltype(view)>;
+        match_aggregator_distributed_worker<AggValueT, AggregatorT>(worker, dg, patterns, process, view);
       }
     } else if (work_type == PgWorkType::MatchVector) {
       if (work_type_msg.agg_value_type == AggValueType::Bool) {
@@ -2624,17 +2423,23 @@ namespace Peregrine
         };
         const auto process = Context::processExistence;
 
-        match_vector_distributed_worker<trivial_wrapper<bool>>(worker, dg, patterns, process, view);
+        using AggValueT = trivial_wrapper<bool>;
+        using AggregatorT = VecAggregator<AggValueT, Peregrine::AT_THE_END, Peregrine::UNSTOPPABLE, decltype(view)>;
+        match_aggregator_distributed_worker<AggValueT, AggregatorT>(worker, dg, patterns, process, view);
       } else if (work_type_msg.agg_value_type == AggValueType::Domain) {
         const auto view = [](auto &&v) { return v.get_support(); };
         const auto process = Context::processSecondFsm;
 
-        match_vector_distributed_worker<struct Domain>(worker, dg, patterns, process, view);
+        using AggValueT = struct Domain;
+        using AggregatorT = VecAggregator<AggValueT, Peregrine::AT_THE_END, Peregrine::UNSTOPPABLE, decltype(view)>;
+        match_aggregator_distributed_worker<AggValueT, AggregatorT>(worker, dg, patterns, process, view);
       } else if (work_type_msg.agg_value_type == AggValueType::DiscoveryDomain) {
         const auto view = [](auto &&v) { return v.get_support(); };
         const auto process = Context::processFirstFsm;
 
-        match_vector_distributed_worker<struct DiscoveryDomain>(worker, dg, patterns, process, view);
+        using AggValueT = struct DiscoveryDomain;
+        using AggregatorT = VecAggregator<AggValueT, Peregrine::AT_THE_END, Peregrine::UNSTOPPABLE, decltype(view)>;
+        match_aggregator_distributed_worker<AggValueT, AggregatorT>(worker, dg, patterns, process, view);
       }
     } else if (work_type == PgWorkType::MatchMulti) {
       if (work_type_msg.agg_value_type == AggValueType::Bool) {
@@ -2645,17 +2450,23 @@ namespace Peregrine
         };
         const auto process = Context::processExistence;
 
-        match_multi_distributed_worker<Pattern, trivial_wrapper<bool>>(worker, dg, patterns, process, view);
+        using AggValueT = trivial_wrapper<bool>;
+        using AggregatorT = MapAggregator<Pattern, AggValueT, Peregrine::AT_THE_END, Peregrine::UNSTOPPABLE, decltype(view)>;
+        match_aggregator_distributed_worker<AggValueT, AggregatorT, Pattern>(worker, dg, patterns, process, view);
       } else if (work_type_msg.agg_value_type == AggValueType::Domain) {
         const auto view = [](auto &&v) { return v.get_support(); };
         const auto process = Context::processSecondFsm;
 
-        match_multi_distributed_worker<Pattern, struct Domain>(worker, dg, patterns, process, view);
+        using AggValueT = struct Domain;
+        using AggregatorT = MapAggregator<Pattern, AggValueT, Peregrine::AT_THE_END, Peregrine::UNSTOPPABLE, decltype(view)>;
+        match_aggregator_distributed_worker<AggValueT, AggregatorT, Pattern>(worker, dg, patterns, process, view);
       } else if (work_type_msg.agg_value_type == AggValueType::DiscoveryDomain) {
         const auto view = [](auto &&v) { return v.get_support(); };
         const auto process = Context::processFirstFsm;
 
-        match_multi_distributed_worker<Pattern, struct DiscoveryDomain>(worker, dg, patterns, process, view);
+        using AggValueT = struct DiscoveryDomain;
+        using AggregatorT = MapAggregator<Pattern, AggValueT, Peregrine::AT_THE_END, Peregrine::UNSTOPPABLE, decltype(view)>;
+        match_aggregator_distributed_worker<AggValueT, AggregatorT, Pattern>(worker, dg, patterns, process, view);
       }
     }
   }

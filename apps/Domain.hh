@@ -82,7 +82,9 @@ struct Domain
   {}
 
   Domain(size_t num_sets, bool always_true) : sets(num_sets)
-  {}
+  {
+    (void) always_true;
+  }
 
   Domain(char* buf, size_t nsets)
   {
@@ -189,7 +191,10 @@ struct DiscoveryDomain
   {}
 
   DiscoveryDomain(size_t num_sets, bool always_true) : sets(2)
-  {}
+  {
+    (void) num_sets;
+    (void) always_true;
+  }
 
   DiscoveryDomain(char* buf, size_t nsets)
   {
