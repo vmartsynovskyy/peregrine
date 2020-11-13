@@ -150,17 +150,18 @@ namespace Peregrine
     std::vector<std::string> worker_ids;
   };
 
+  const uint64_t NUM_TASKS_PER_ITEM = 1024;
+  const uint32_t NUM_ACTIVE_TASKS_PER_WORKER = 10;
+
   class TaskIterator
   {
   public:
-    uint64_t num_tasks_per_item = 1024;
     class iterator: public std::iterator<std::input_iterator_tag, struct Task>
     {
       const DataGraph &dg;
       const std::vector<SmallGraph> &patterns;
       uint64_t curr_task_id = 0;
       uint64_t task_item_start = 0;
-      uint64_t num_tasks_per_item = 1024;
       uint64_t num_tasks = 0;
       size_t pattern_idx = 0;
 
@@ -179,7 +180,7 @@ namespace Peregrine
       iterator& operator++()
       {
         curr_task_id++;
-        task_item_start += num_tasks_per_item;
+        task_item_start += NUM_TASKS_PER_ITEM;
         if (task_item_start > num_tasks) {
           pattern_idx++;
           if (pattern_idx >= patterns.size()) {
@@ -201,7 +202,7 @@ namespace Peregrine
         struct Task task {
           .task_id     = curr_task_id,
           .start_task  = task_item_start,
-          .end_task    = std::min(task_item_start + num_tasks_per_item, num_tasks + 1),
+          .end_task    = std::min(task_item_start + NUM_TASKS_PER_ITEM, num_tasks + 1),
           .pattern_idx = (uint32_t) pattern_idx,
         };
         return task;
@@ -257,55 +258,6 @@ namespace Peregrine
     void reset() { val = T(); }
     T val;
   };
-
-
-  std::pair<std::unique_ptr<zmq::socket_t>, std::unique_ptr<zmq::socket_t>>
-  create_worker_sockets(zmq::context_t &ctx, std::string master_host)
-  {
-    auto worker_pull_sock = std::make_unique<zmq::socket_t>(ctx, zmq::socket_type::pull);
-    auto worker_push_sock = std::make_unique<zmq::socket_t>(ctx, zmq::socket_type::push);
-
-    worker_pull_sock->set(zmq::sockopt::linger, 0);
-    worker_push_sock->set(zmq::sockopt::linger, 0);
-
-    char hostname_buf[HOST_NAME_MAX + 11];
-
-    std::snprintf(hostname_buf, HOST_NAME_MAX + 11, "tcp://%s:9999", master_host.c_str());
-    worker_pull_sock->connect(hostname_buf);
-
-    std::snprintf(hostname_buf, HOST_NAME_MAX + 11, "tcp://%s:9998", master_host.c_str());
-    worker_push_sock->connect(hostname_buf);
-
-    worker_push_sock->send(zmq::str_buffer("ready"), zmq::send_flags::none);
-
-    return std::pair(std::move(worker_pull_sock), std::move(worker_push_sock));
-  }
-
-  std::pair<std::unique_ptr<zmq::socket_t>, std::unique_ptr<zmq::socket_t>>
-  create_master_sockets(zmq::context_t &ctx, uint32_t nworkers)
-  {
-    auto master_pull_sock = std::make_unique<zmq::socket_t>(ctx, zmq::socket_type::pull);
-    auto master_push_sock = std::make_unique<zmq::socket_t>(ctx, zmq::socket_type::push);
-
-    master_pull_sock->set(zmq::sockopt::linger, 0);
-    master_push_sock->set(zmq::sockopt::linger, 0);
-
-    master_push_sock->bind("tcp://*:9999");
-    master_pull_sock->bind("tcp://*:9998");
-
-    zmq::message_t ready_msg;
-    uint32_t num_workers_ready = 0;
-    utils::Log{} << "Waiting for all workers to become ready...\n";
-    while (num_workers_ready < nworkers) {
-      auto res = master_pull_sock->recv(ready_msg, zmq::recv_flags::none);
-      if (res.has_value() && strcmp((char*) ready_msg.data(), "ready")) {
-        num_workers_ready++;
-        utils::Log{} << "[" << num_workers_ready << "/" << nworkers << "] workers are ready" << "\n";
-      }
-    }
-
-    return std::pair(std::move(master_pull_sock), std::move(master_push_sock));
-  }
 
   bool
   send_task_msg(zmq::socket_t &socket, const std::string &worker_id, struct Task task)
@@ -709,11 +661,10 @@ namespace Peregrine
 
     TaskIterator task_it(*dg, new_patterns);
     auto curr_task_it = task_it.begin();
-    uint32_t num_active_tasks_per_worker = 3;
     size_t num_workers = master.worker_ids.size();
     while (tasks_completed < tasks_sent || !curr_task_it.end) {
         std::string worker_id;
-        if (tasks_sent < num_workers * num_active_tasks_per_worker && !curr_task_it.end) {
+        if (tasks_sent < num_workers * NUM_ACTIVE_TASKS_PER_WORKER  && !curr_task_it.end) {
           worker_id = master.worker_ids[tasks_sent % num_workers];
         } else {
           auto [pg_msg, data, msg_worker_id] = get_pg_msg_data_and_id(master);
@@ -1502,11 +1453,10 @@ namespace Peregrine
     uint64_t tasks_completed = 0;
     TaskIterator task_it(*dg, patterns);
     auto curr_task_it = task_it.begin();
-    uint32_t num_active_tasks_per_worker = 3;
     size_t num_workers = master.worker_ids.size();
     while (tasks_completed < tasks_sent || !curr_task_it.end) {
         std::string worker_id;
-        if (tasks_sent < num_workers * num_active_tasks_per_worker && !curr_task_it.end) {
+        if (tasks_sent < num_workers * NUM_ACTIVE_TASKS_PER_WORKER && !curr_task_it.end) {
           worker_id = master.worker_ids[tasks_sent % num_workers];
         } else {
           auto [pg_msg, data, msg_worker_id] = get_pg_msg_data_and_id(master);
@@ -1743,11 +1693,10 @@ namespace Peregrine
     uint64_t tasks_completed = 0;
     TaskIterator task_it(*dg, patterns);
     auto curr_task_it = task_it.begin();
-    uint32_t num_active_tasks_per_worker = 3;
     size_t num_workers = master.worker_ids.size();
     while (tasks_completed < tasks_sent || !curr_task_it.end) {
         std::string worker_id;
-        if (tasks_sent < num_workers * num_active_tasks_per_worker && !curr_task_it.end) {
+        if (tasks_sent < num_workers * NUM_ACTIVE_TASKS_PER_WORKER && !curr_task_it.end) {
           worker_id = master.worker_ids[tasks_sent % num_workers];
         } else {
           auto [pg_msg, data, msg_worker_id] = get_pg_msg_data_and_id(master);
@@ -1925,11 +1874,10 @@ namespace Peregrine
     uint64_t tasks_completed = 0;
     TaskIterator task_it(*dg, patterns);
     auto curr_task_it = task_it.begin();
-    uint32_t num_active_tasks_per_worker = 3;
     size_t num_workers = master.worker_ids.size();
     while (tasks_completed < tasks_sent || !curr_task_it.end) {
         std::string worker_id;
-        if (tasks_sent < num_workers * num_active_tasks_per_worker && !curr_task_it.end) {
+        if (tasks_sent < num_workers * NUM_ACTIVE_TASKS_PER_WORKER && !curr_task_it.end) {
           worker_id = master.worker_ids[tasks_sent % num_workers];
         } else {
           auto [pg_msg, data, msg_worker_id] = get_pg_msg_data_and_id(master);
