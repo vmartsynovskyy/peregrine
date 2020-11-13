@@ -44,7 +44,7 @@ TEST(MatchingIntegration)
 
     std::vector<Peregrine::SmallGraph> patterns = {Peregrine::PatternGenerator::star(3)};
     patterns.front().set_labelling(Peregrine::Graph::DISCOVER_LABELS);
-    auto psupps = Peregrine::match<Peregrine::Pattern, DiscoveryDomain, Peregrine::AT_THE_END, Peregrine::UNSTOPPABLE>(data_graph_name, patterns, nthreads, process, view);
+    auto psupps = Peregrine::match<Peregrine::Pattern, struct DiscoveryDomain, Peregrine::AT_THE_END, Peregrine::UNSTOPPABLE>(data_graph_name, patterns, nthreads, process, view);
     for (const auto &[p, supp] : psupps)
     {
       if (supp >= threshold)
@@ -73,7 +73,7 @@ TEST(MatchingIntegration)
     supports.clear();
 
     auto tt1 = utils::get_timestamp();
-    auto psupps = Peregrine::match<Peregrine::Pattern, Domain, Peregrine::AT_THE_END, Peregrine::UNSTOPPABLE>(data_graph_name, patterns, nthreads, process, view);
+    auto psupps = Peregrine::match<Peregrine::Pattern, struct Domain, Peregrine::AT_THE_END, Peregrine::UNSTOPPABLE>(data_graph_name, patterns, nthreads, process, view);
 
     for (const auto &[p, supp] : psupps)
     {

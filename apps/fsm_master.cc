@@ -19,26 +19,23 @@ int main(int argc, char *argv[])
   uint32_t k = std::stoi(argv[2]);
 
   uint64_t threshold = std::stoi(argv[3]);
-  size_t nthreads = argc < 5 ? std::thread::hardware_concurrency() : std::stoi(argv[4]);
+  size_t nworkers = argc < 5 ? std::thread::hardware_concurrency() : std::stoi(argv[4]);
 
   const auto view = [](auto &&v) { return v.get_support(); };
 
   std::vector<uint64_t> supports;
   std::vector<Peregrine::SmallGraph> freq_patterns;
 
+  Peregrine::Master master = Peregrine::create_master(nworkers, data_graph_name);
+
   std::cout << k << "-FSM with threshold " << threshold << std::endl;
 
   // initial discovery
   auto t1 = utils::get_timestamp();
   {
-    const auto process = [](auto &&a, auto &&cm) {
-      uint32_t merge = cm.pattern[1] == cm.pattern[2] ? 1 : 2;
-      a.map(cm.pattern, std::make_pair(cm.mapping, merge));
-    };
-
     std::vector<Peregrine::SmallGraph> patterns = {Peregrine::PatternGenerator::star(3)};
     patterns.front().set_labelling(Peregrine::Graph::DISCOVER_LABELS);
-    auto psupps = Peregrine::match<Peregrine::Pattern, struct DiscoveryDomain, Peregrine::AT_THE_END, Peregrine::UNSTOPPABLE>(data_graph_name, patterns, nthreads, process, view);
+    auto psupps = Peregrine::match_distributed<Peregrine::Pattern, struct DiscoveryDomain>(master, patterns, view);
     for (const auto &[p, supp] : psupps)
     {
       if (supp >= threshold)
@@ -51,16 +48,12 @@ int main(int argc, char *argv[])
 
   std::vector<Peregrine::SmallGraph> patterns = Peregrine::PatternGenerator::extend(freq_patterns, Peregrine::PatternGenerator::EDGE_BASED);
 
-  const auto process = [](auto &&a, auto &&cm) {
-    a.map(cm.pattern, cm.mapping);
-  };
-
   uint32_t step = 2;
   while (step < k && !patterns.empty())
   {
     freq_patterns.clear();
     supports.clear();
-    auto psupps = Peregrine::match<Peregrine::Pattern, struct Domain, Peregrine::AT_THE_END, Peregrine::UNSTOPPABLE>(data_graph_name, patterns, nthreads, process, view);
+    auto psupps = Peregrine::match_distributed<Peregrine::Pattern, struct Domain>(master, patterns, view);
 
     for (const auto &[p, supp] : psupps)
     {
@@ -85,3 +78,4 @@ int main(int argc, char *argv[])
   std::cout << "finished in " << (t2-t1)/1e6 << "s" << std::endl;
   return 0;
 }
+

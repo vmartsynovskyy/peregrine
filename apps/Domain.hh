@@ -5,6 +5,7 @@
 #include "Peregrine.hh"
 #include <cereal/archives/binary.hpp>
 #include <cereal/types/vector.hpp>
+#include <cereal/types/string.hpp>
 #include <memory>
 #include <cstring>
 
@@ -266,24 +267,20 @@ struct DiscoveryDomain
 template<class Archive>
 void save(Archive & archive, Roaring const & r)
 { 
-  auto r_buf_size = r.getSizeInBytes();
-  auto r_buf = std::make_unique<unsigned char []>(r_buf_size);
-  r.write((char *)&r_buf, r_buf_size);
+  auto r_size = r.getSizeInBytes(false);
+  std::string data(r_size, '\0');
+  r.write(data.data(), false);
 
-  archive(cereal::make_size_tag(r_buf_size));
-  archive(cereal::binary_data(&r_buf, r_buf_size)); 
+  archive(data); 
 }
 
 template<class Archive>
 void load(Archive & archive, Roaring & r)
 { 
-  size_t r_buf_size;
-  archive(cereal::make_size_tag(r_buf_size));
+  std::string data;
+  archive(data); 
 
-  auto r_buf = std::make_unique<unsigned char []>(r_buf_size);
-  archive(cereal::binary_data(&r_buf, r_buf_size)); 
-
-  r.readSafe((char *)&r_buf, r_buf_size);
+  r = r.read(data.data(), false);
 }
 
 #endif

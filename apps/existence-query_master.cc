@@ -18,7 +18,7 @@ int main(int argc, char *argv[])
 {
   if (argc < 3)
   {
-    std::cerr << "USAGE: " << argv[0] << " <data graph> <pattern | #-motifs | #-clique> [# workers]" << std::endl;
+    std::cerr << "USAGE: " << argv[0] << " <data graph> <pattern | #-clique> [# workers]" << std::endl;
     return -1;
   }
 
@@ -27,31 +27,26 @@ int main(int argc, char *argv[])
   size_t num_workers = argc > 3 ? std::stoi(argv[3]) : 1;
 
   std::vector<Peregrine::SmallGraph> patterns;
-  if (auto end = pattern_name.rfind("motifs"); end != std::string::npos)
-  {
-    auto k = std::stoul(pattern_name.substr(0, end-1));
-    patterns = Peregrine::PatternGenerator::all(k,
-        Peregrine::PatternGenerator::VERTEX_BASED,
-        Peregrine::PatternGenerator::INCLUDE_ANTI_EDGES);
-  }
-  else if (auto end = pattern_name.rfind("clique"); end != std::string::npos)
+  std::string display_name;
+  if (auto end = pattern_name.rfind("clique"); end != std::string::npos)
   {
     auto k = std::stoul(pattern_name.substr(0, end-1));
     patterns.emplace_back(Peregrine::PatternGenerator::clique(k));
+    display_name = std::to_string(k) + "-clique";
   }
   else
   {
     patterns.emplace_back(pattern_name);
+    display_name = patterns.front().to_string();
   }
 
-  std::vector<std::pair<Peregrine::SmallGraph, uint64_t>> result;
   Peregrine::Master master = Peregrine::create_master(num_workers, data_graph_name);
-  result = Peregrine::count_distributed(master, patterns);
 
-  for (const auto &[p, v] : result)
-  {
-    std::cout << p << ": " << v << std::endl;
-  }
+  std::vector<std::pair<Peregrine::SmallGraph, bool>> results = Peregrine::match_distributed<Peregrine::Pattern, bool>(master, patterns);
+
+  std::cout << display_name;
+  if (results.front().second) std::cout << " exists in " << data_graph_name << std::endl;
+  else std::cout << " doesn't exist in " << data_graph_name << std::endl;
 
   master.sock->close();
   master.context.close();

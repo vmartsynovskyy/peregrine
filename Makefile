@@ -5,7 +5,7 @@ OBJ=core/roaring.o core/DataGraph.o core/PO.o core/utils.o core/PatternGenerator
 OUTDIR=bin/
 CC=g++
 
-all: bliss fsm count test existence-query convert_data
+all: bliss fsm count test existence-query convert_data worker count_master fsm_master existence-query_master
 
 core/roaring.o: core/roaring/roaring.c
 	gcc -c core/roaring/roaring.c -o $@ -O3 -Wall -Wextra -Wpedantic -fPIC 
@@ -19,14 +19,17 @@ worker: apps/worker.cc $(OBJ) bliss
 count_master: apps/count_master.cc $(OBJ) bliss
 	$(CC) apps/count_master.cc $(OBJ) -o $(OUTDIR)/$@ $(LDFLAGS) $(CFLAGS)
 
-fsm-single: apps/fsm-single.cc $(OBJ) bliss
-	$(CC) apps/fsm-single.cc $(OBJ) -o $(OUTDIR)/$@ $(LDFLAGS) $(CFLAGS)
+fsm_master: apps/fsm_master.cc $(OBJ) bliss
+	$(CC) apps/fsm_master.cc $(OBJ) -o $(OUTDIR)/$@ $(LDFLAGS) $(CFLAGS)
 
 fsm: apps/fsm.cc $(OBJ) bliss
 	$(CC) apps/fsm.cc $(OBJ) -o $(OUTDIR)/$@ $(LDFLAGS) $(CFLAGS)
 
 existence-query: apps/existence-query.cc $(OBJ) bliss
 	$(CC) apps/existence-query.cc $(OBJ) -o $(OUTDIR)/$@ $(LDFLAGS) $(CFLAGS)
+
+existence-query_master: apps/existence-query_master.cc $(OBJ) bliss
+	$(CC) apps/existence-query_master.cc $(OBJ) -o $(OUTDIR)/$@ $(LDFLAGS) $(CFLAGS)
 
 count: apps/count.cc $(OBJ) bliss
 	$(CC) apps/count.cc $(OBJ) -o $(OUTDIR)/$@ $(LDFLAGS) $(CFLAGS)

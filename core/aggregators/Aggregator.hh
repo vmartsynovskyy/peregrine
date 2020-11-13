@@ -110,6 +110,19 @@ namespace Peregrine
         }
       }
     }
+
+    void dump()
+    {
+      for (auto &val : values)
+      {
+        std::unordered_map<AggKeyT, AggValueT> *map = val.load().v;
+        //for (uint32_t i = 0; i < vec->size(); ++i)
+        for (const auto &[i, v] : *map)
+        {
+          std::cout << viewer(global[i]) << "\n";
+        }
+      }
+    }
   
     void reset()
     {
