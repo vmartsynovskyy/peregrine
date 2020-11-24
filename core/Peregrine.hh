@@ -451,6 +451,21 @@ namespace Peregrine
     return lcount;
   }
 
+  std::string
+  read_datagraph_path(
+      const std::string &data_str
+  )
+  {
+    std::string result;
+    std::stringstream ss(data_str);
+    {
+      cereal::BinaryInputArchive archive(ss);
+      archive(result);
+    }
+
+    return result;
+  }
+
   std::vector<SmallGraph>
   read_patterns(
       const std::string &data_str
@@ -464,6 +479,36 @@ namespace Peregrine
     }
 
     return results;
+  }
+
+  void
+  send_datagraph_path_to_workers(
+      const Master &master,
+      const std::string &datagraph_path
+  )
+  {
+    for (auto &identity : master.worker_ids) {
+      zmq::multipart_t multi_msg;
+      multi_msg.addstr(identity);
+      multi_msg.addstr("");
+
+      struct PeregrineMessage pattern_pg_msg{};
+      pattern_pg_msg.msg_type = MessageType::DataGraphPath;
+      std::stringstream ss;
+      {
+        cereal::BinaryOutputArchive archive(ss);
+
+        archive(datagraph_path);
+      }
+      auto serial_data = ss.str();
+      zmq::message_t pattern_msg(sizeof(pattern_pg_msg) + serial_data.length());
+      char *msg_buff = static_cast<char*>(pattern_msg.data());
+      std::memcpy(msg_buff, &pattern_pg_msg, sizeof(pattern_pg_msg));
+      std::memcpy(msg_buff + sizeof(pattern_pg_msg), serial_data.data(), serial_data.size());
+      multi_msg.add(std::move(pattern_msg));
+
+      multi_msg.send(*master.sock, 0);
+    }
   }
 
   void
@@ -2437,17 +2482,12 @@ namespace Peregrine
     }
   }
 
-  template <typename DataGraphT>
   void
-  start_worker(DataGraphT &&data_graph, size_t nthreads, std::string master_host)
+  start_worker(size_t nthreads, std::string master_host)
   {
     struct Worker worker;
-    DataGraph dg(data_graph);
-    Context::data_graph = &dg;
-    utils::Log{} << "Finished reading datagraph: |V| = " << dg.get_vertex_count()
-              << " |E| = " << dg.get_edge_count()
-              << "\n";
-
+    std::string last_datagraph_path;
+    std::unique_ptr<DataGraph> dg;
     zmq::context_t ctx;
     worker.context = std::move(ctx);
     worker.nthreads = nthreads;
@@ -2472,13 +2512,22 @@ namespace Peregrine
       auto [pg_msg, data_str] = get_pg_msg_and_data(worker);
       if (pg_msg.msg_type == MessageType::Patterns) {
         patterns = read_patterns(data_str);
+      } else if (pg_msg.msg_type == MessageType::DataGraphPath) {
+        std::string new_datagraph_path = read_datagraph_path(data_str);
+        if (new_datagraph_path != last_datagraph_path) {
+          dg = std::make_unique<DataGraph>(read_datagraph_path(data_str));
+          Context::data_graph = dg.get();
+          utils::Log{} << "Finished reading datagraph: |V| = " << dg->get_vertex_count()
+                    << " |E| = " << dg->get_edge_count()
+                    << "\n";
+        }
       } else if (pg_msg.msg_type == MessageType::WorkType) {
         PgWorkType work_type = pg_msg.msg.work_type_msg.work_type;
-        WorkTypeMessage work_type_msg = pg_msg.msg.work_type_msg;
         if (work_type == PgWorkType::Count) {
-          count_distributed_worker(worker, dg, patterns);
+          count_distributed_worker(worker, *dg, patterns);
         } else {
-          match_distributed_worker(worker, work_type_msg, dg, patterns);
+          WorkTypeMessage work_type_msg = pg_msg.msg.work_type_msg;
+          match_distributed_worker(worker, work_type_msg, *dg, patterns);
         }
       } else {
         utils::Log{} << "Worker received unexepected message of type " << pg_msg.msg_type << "\n";
@@ -2515,6 +2564,9 @@ namespace Peregrine
         utils::Log{} << "[" << num_workers_ready << "/" << nworkers << "] workers are ready" << "\n";
       }
     }
+
+    send_datagraph_path_to_workers(master, data_graph_name);
+
     return master;
   }
 } // namespace Peregrine
