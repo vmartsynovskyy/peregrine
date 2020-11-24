@@ -1799,19 +1799,21 @@ namespace Peregrine
     barrier.join();
 
     utils::timestamp_t working_t_sum = 0;
+    utils::timestamp_t agg_t_sum = 0;
     auto t1 = utils::get_timestamp();
     uint64_t worker_tasks_completed = 0;
+    uint64_t tasks_sum = 0;
     for (;;) {
       auto [task_pg_msg, data] = get_pg_msg_and_data(worker);
       if (task_pg_msg.msg_type == MessageType::JobDone) {
         break;
       }
 
-      auto working_t1 = utils::get_timestamp();
 
       // reset state
       Context::task_ctr = task_pg_msg.msg.task.start_task;
       Context::task_end = task_pg_msg.msg.task.end_task;
+      tasks_sum += (Context::task_end - Context::task_ctr);
 
       // set new pattern
       Context::pattern_idx = task_pg_msg.msg.task.pattern_idx;
@@ -1821,20 +1823,30 @@ namespace Peregrine
       // prepare handles for the next pattern
       aggregator.reset();
 
-      barrier.release();
+      auto working_t1 = utils::get_timestamp();
 
+      barrier.release();
       barrier.join();
 
+      auto working_t2 = utils::get_timestamp();
+
+      auto agg_t1 = utils::get_timestamp();
       // get thread-local values
       aggregator.get_result();
+      auto agg_t2 = utils::get_timestamp();
 
-      auto working_t2 = utils::get_timestamp();
       working_t_sum += (working_t2 - working_t1);
+      agg_t_sum += (agg_t2 - agg_t1);
 
       send_match_task_complete_msg(*worker.sock, task_pg_msg.msg.task, aggregator.global);
       worker_tasks_completed++;
     }
     auto t2 = utils::get_timestamp();
+    utils::Log{} << "worker is done all tasks in queue after completing "
+                 << worker_tasks_completed << " tasks, "
+                 << tasks_sum << " vertices ("
+                 << working_t_sum/1e6 << "s of working time, "
+                 << agg_t_sum/1e6     << "s of aggregation time)\n";
 
     barrier.finish();
     for (auto &th : pool)
@@ -1981,6 +1993,7 @@ namespace Peregrine
     barrier.join();
 
     auto t1 = utils::get_timestamp();
+    uint64_t task_sum = 0;
     for (const auto &p : patterns)
     {
       // reset state
@@ -1989,6 +2002,10 @@ namespace Peregrine
       // set new pattern
       dg.set_rbi(p);
       Context::current_pattern = std::make_shared<AnalyzedPattern>(AnalyzedPattern(dg.rbi));
+      uint32_t vgs_count = dg.get_vgs_count();
+      uint32_t num_vertices = dg.get_vertex_count();
+      uint64_t num_tasks = num_vertices * vgs_count;
+      task_sum += num_tasks;
       // prepare handles for the next pattern
       aggregator.reset();
 
@@ -2066,6 +2083,7 @@ namespace Peregrine
 
     utils::Log{} << "-------" << "\n";
     utils::Log{} << "all patterns finished after " << (t2-t1)/1e6 << "s" << "\n";
+    utils::Log{} << "all patterns finished with " << task_sum << " tasks" << "\n";
 
     return results;
   }
@@ -2099,20 +2117,20 @@ namespace Peregrine
         break;
       }
 
-      auto working_t1 = utils::get_timestamp();
       Context::gcount = 0;
 
       Context::task_ctr = task_pg_msg.msg.task.start_task;
       Context::task_end = task_pg_msg.msg.task.end_task;
       Context::pattern_idx = task_pg_msg.msg.task.pattern_idx;
       dg.set_rbi(patterns[Context::pattern_idx]);
+      auto working_t1 = utils::get_timestamp();
 
       barrier.release();
-
       barrier.join();
 
-      uint64_t global_count = Context::gcount;
       auto working_t2 = utils::get_timestamp();
+
+      uint64_t global_count = Context::gcount;
       working_t_sum += (working_t2 - working_t1);
 
       send_task_complete_msg(*worker.sock, &task_pg_msg.msg.task, global_count);
