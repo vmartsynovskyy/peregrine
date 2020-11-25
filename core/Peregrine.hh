@@ -1525,7 +1525,6 @@ namespace Peregrine
           for (auto &r : agg_result) { 
             if (process(r)) {
               curr_task_it.end = true;
-              utils::Log{} << "Process returned true\n";
             }
           }
 
@@ -1773,7 +1772,6 @@ namespace Peregrine
           }
           if (process(agg_result)) {
             curr_task_it.end = true;
-            utils::Log{} << "Process returned true\n";
           }
 
           results_map[pattern_idx] += agg_result;
@@ -1972,7 +1970,6 @@ namespace Peregrine
           for (auto &[k, v] : agg_result) {
             if (process(v)) {
               curr_task_it.end = true;
-              utils::Log{} << "Process returned true\n";
             }
             auto results_map_val = results_map[pattern_idx].find(k);
             if (results_map_val == results_map[pattern_idx].end()) {
