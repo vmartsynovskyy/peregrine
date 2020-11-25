@@ -42,7 +42,11 @@ int main(int argc, char *argv[])
 
   Peregrine::Master master = Peregrine::create_master(num_workers, data_graph_name);
 
-  std::vector<std::pair<Peregrine::SmallGraph, bool>> results = Peregrine::match_distributed<Peregrine::Pattern, bool>(master, patterns);
+  const auto process = [](auto &&agg_value) {
+    return agg_value.get_support();
+  };
+
+  std::vector<std::pair<Peregrine::SmallGraph, bool>> results = Peregrine::match_distributed<Peregrine::Pattern, bool>(master, patterns, process);
 
   std::cout << display_name;
   if (results.front().second) std::cout << " exists in " << data_graph_name << std::endl;

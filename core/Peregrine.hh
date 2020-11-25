@@ -254,6 +254,11 @@ namespace Peregrine
       return 1;
     }
 
+    uint64_t get_support()
+    {
+      return static_cast<uint64_t>(val);
+    }
+
     trivial_wrapper<T> &operator+=(const trivial_wrapper<T> &other) { val += other.val; return *this; }
     void reset() { val = T(); }
     T val;
@@ -1461,14 +1466,16 @@ namespace Peregrine
     return multi_zmq_msg.send(socket, 0);
   }
 
-  template <typename AggValueT, typename VF>
+  template <typename AggValueT, typename PF, typename VF>
   std::vector<std::pair<SmallGraph, decltype(std::declval<VF>()(std::declval<AggValueT>()))>>
   match_vector_distributed(
       Master &master,
+      PF &&process,
       VF &&viewer,
       const std::vector<SmallGraph> &patterns
   )
   {
+    utils::Log{} << "using vector\n";
     // initialize
     std::vector<std::pair<SmallGraph, decltype(std::declval<VF>()(std::declval<AggValueT>()))>> results;
     if (patterns.empty()) return results;
@@ -1513,6 +1520,13 @@ namespace Peregrine
           {
             cereal::BinaryInputArchive archive(ss);
             archive(agg_result);
+          }
+
+          for (auto &r : agg_result) { 
+            if (process(r)) {
+              curr_task_it.end = true;
+              utils::Log{} << "Process returned true\n";
+            }
           }
 
           auto pattern_results_map = results_map[pattern_idx];
@@ -1708,14 +1722,16 @@ namespace Peregrine
     return multi_zmq_msg.send(socket, 0);
   }
 
-  template <typename AggValueT, typename VF>
+  template <typename AggValueT, typename PF, typename VF>
   std::vector<std::pair<SmallGraph, decltype(std::declval<VF>()(std::declval<AggValueT>()))>>
   match_single_distributed(
       Master &master,
+      PF &&process,
       VF &&viewer,
       const std::vector<SmallGraph> &patterns
   )
   {
+    utils::Log{} << "using single\n";
     // initialize
     std::vector<std::pair<SmallGraph, decltype(std::declval<VF>()(std::declval<AggValueT>()))>> results;
     if (patterns.empty()) return results;
@@ -1754,6 +1770,10 @@ namespace Peregrine
           {
             cereal::BinaryInputArchive archive(ss);
             archive(agg_result);
+          }
+          if (process(agg_result)) {
+            curr_task_it.end = true;
+            utils::Log{} << "Process returned true\n";
           }
 
           results_map[pattern_idx] += agg_result;
@@ -1854,7 +1874,6 @@ namespace Peregrine
         break;
       }
 
-
       // reset state
       Context::task_ctr = task_pg_msg.msg.task.start_task;
       Context::task_end = task_pg_msg.msg.task.end_task;
@@ -1905,14 +1924,16 @@ namespace Peregrine
     return;
   }
 
-  template <typename AggKeyT, typename AggValueT, typename VF>
+  template <typename AggKeyT, typename AggValueT, typename PF, typename VF>
   std::vector<std::pair<SmallGraph, decltype(std::declval<VF>()(std::declval<AggValueT>()))>>
   match_multi_distributed(
       Master &master,
+      PF &&process,
       VF &&viewer,
       const std::vector<SmallGraph> &patterns
   )
   {
+    utils::Log{} << "using multi\n";
     // initialize
     std::vector<std::pair<SmallGraph, decltype(std::declval<VF>()(std::declval<AggValueT>()))>> results;
     if (patterns.empty()) return results;
@@ -1949,6 +1970,10 @@ namespace Peregrine
           }
 
           for (auto &[k, v] : agg_result) {
+            if (process(v)) {
+              curr_task_it.end = true;
+              utils::Log{} << "Process returned true\n";
+            }
             auto results_map_val = results_map[pattern_idx].find(k);
             if (results_map_val == results_map[pattern_idx].end()) {
               results_map[pattern_idx][k] = v;
@@ -2308,15 +2333,19 @@ namespace Peregrine
     return results;
   }
 
+  auto default_master_process = [](auto &&) { return false; };
+
   template <
     typename AggKeyT,
     typename GivenAggValueT,
+    typename PF = decltype(default_master_process),
     typename VF = decltype(default_viewer<GivenAggValueT>)
   >
   std::vector<std::pair<SmallGraph, decltype(std::declval<VF>()(std::declval<GivenAggValueT>()))>>
   match_distributed(
       Master &master,
       const std::vector<SmallGraph> &patterns,
+      PF master_process = default_master_process,
       VF viewer = default_viewer<GivenAggValueT>)
   {
     if (patterns.empty())
@@ -2373,9 +2402,9 @@ namespace Peregrine
           << "\n";
       }
 
-      auto result = match_single_distributed<AggValueT>(master, view, single);
-      auto vector_result = match_vector_distributed<AggValueT>(master, view, vector);
-      auto multi_result = match_multi_distributed<AggKeyT, AggValueT>(master, view, multi);
+      auto result = match_single_distributed<AggValueT>(master, master_process, view, single);
+      auto vector_result = match_vector_distributed<AggValueT>(master, master_process, view, vector);
+      auto multi_result = match_multi_distributed<AggKeyT, AggValueT>(master, master_process, view, multi);
 
       result.insert(result.end(), vector_result.begin(), vector_result.end());
       result.insert(result.end(), multi_result.begin(), multi_result.end());
