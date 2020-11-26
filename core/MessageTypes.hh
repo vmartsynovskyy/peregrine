@@ -12,6 +12,7 @@ enum MessageType : uint32_t {
   WorkType,
   StopWorker,
   DataGraphPath,
+  Heartbeat,
 };
 
 enum PgWorkType : uint32_t {

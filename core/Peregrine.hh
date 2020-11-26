@@ -3,6 +3,7 @@
 
 #include <type_traits>
 #include <thread>
+#include <future>
 #include <chrono>
 #include <mutex>
 #include <condition_variable>
@@ -10,6 +11,7 @@
 #include <algorithm>
 #include <bitset>
 #include <cstdlib>
+#include <unistd.h>
 
 #include "Options.hh"
 #include "Graph.hh"
@@ -142,12 +144,17 @@ namespace Peregrine
 
 namespace Peregrine
 {
+  struct WorkerStatus {
+    std::string worker_id;
+    utils::timestamp_t last_seen;
+  };
+
   struct Master {
     std::unique_ptr<zmq::socket_t> sock;
     size_t nworkers;
     zmq::context_t context;
     std::unique_ptr<DataGraph> data_graph;
-    std::vector<std::string> worker_ids;
+    std::vector<WorkerStatus> workers;
   };
 
   const uint64_t NUM_TASKS_PER_ITEM = 1024;
@@ -311,7 +318,8 @@ namespace Peregrine
       .msg_type = MessageType::JobDone,
       .msg = {},
     };
-    for (auto worker_id : master.worker_ids) {
+    for (const auto &worker : master.workers) {
+      const auto &worker_id = worker.worker_id;
       zmq::message_t zmq_job_done_msg(&job_done_pg_msg, sizeof(job_done_pg_msg));
       zmq::multipart_t zmq_multi_msg;
       zmq_multi_msg.addstr(worker_id);
@@ -492,7 +500,8 @@ namespace Peregrine
       const std::string &datagraph_path
   )
   {
-    for (auto &identity : master.worker_ids) {
+    for (auto &worker : master.workers) {
+      auto &identity = worker.worker_id; 
       zmq::multipart_t multi_msg;
       multi_msg.addstr(identity);
       multi_msg.addstr("");
@@ -522,7 +531,8 @@ namespace Peregrine
       const std::vector<SmallGraph> &patterns
   )
   {
-    for (auto &identity : master.worker_ids) {
+    for (auto &worker : master.workers) {
+      auto &identity = worker.worker_id;
       zmq::multipart_t multi_msg;
       multi_msg.addstr(identity);
       multi_msg.addstr("");
@@ -553,7 +563,8 @@ namespace Peregrine
       enum PgWorkType work_type
   )
   {
-    for (auto &identity : master.worker_ids) {
+    for (auto &worker : master.workers) {
+      auto &identity = worker.worker_id;
       zmq::multipart_t multi_msg;
       multi_msg.addstr(identity);
       multi_msg.addstr("");
@@ -711,11 +722,11 @@ namespace Peregrine
 
     TaskIterator task_it(*dg, new_patterns);
     auto curr_task_it = task_it.begin();
-    size_t num_workers = master.worker_ids.size();
+    size_t num_workers = master.workers.size();
     while (tasks_completed < tasks_sent || !curr_task_it.end) {
         std::string worker_id;
         if (tasks_sent < num_workers * NUM_ACTIVE_TASKS_PER_WORKER  && !curr_task_it.end) {
-          worker_id = master.worker_ids[tasks_sent % num_workers];
+          worker_id = master.workers[tasks_sent % num_workers].worker_id;
         } else {
           auto [pg_msg, data, msg_worker_id] = get_pg_msg_data_and_id(master);
           worker_id = msg_worker_id;
@@ -1466,6 +1477,18 @@ namespace Peregrine
     return multi_zmq_msg.send(socket, 0);
   }
 
+  void
+  update_liveness(Master &master, std::string worker_id)
+  {
+    auto worker = std::find_if(master.workers.begin(),
+        master.workers.end(),
+        [&worker_id](const WorkerStatus& x) { return x.worker_id == worker_id; });
+    if (worker != master.workers.end()) {
+      worker->last_seen = utils::get_timestamp();
+      utils::Log{} << "Updated liveness for worker with id " << worker->worker_id << " at time " << worker->last_seen / (1e-6) << "\n";
+    }
+  }
+
   template <typename AggValueT, typename PF, typename VF>
   std::vector<std::pair<SmallGraph, decltype(std::declval<VF>()(std::declval<AggValueT>()))>>
   match_vector_distributed(
@@ -1475,7 +1498,6 @@ namespace Peregrine
       const std::vector<SmallGraph> &patterns
   )
   {
-    utils::Log{} << "using vector\n";
     // initialize
     std::vector<std::pair<SmallGraph, decltype(std::declval<VF>()(std::declval<AggValueT>()))>> results;
     if (patterns.empty()) return results;
@@ -1505,14 +1527,18 @@ namespace Peregrine
     uint64_t tasks_completed = 0;
     TaskIterator task_it(*dg, patterns);
     auto curr_task_it = task_it.begin();
-    size_t num_workers = master.worker_ids.size();
+    size_t num_workers = master.workers.size();
     while (tasks_completed < tasks_sent || !curr_task_it.end) {
         std::string worker_id;
         if (tasks_sent < num_workers * NUM_ACTIVE_TASKS_PER_WORKER && !curr_task_it.end) {
-          worker_id = master.worker_ids[tasks_sent % num_workers];
+          worker_id = master.workers[tasks_sent % num_workers].worker_id;
         } else {
           auto [pg_msg, data, msg_worker_id] = get_pg_msg_data_and_id(master);
           worker_id = msg_worker_id;
+          if (pg_msg.msg_type == MessageType::Heartbeat) {
+            update_liveness(master, worker_id);
+            continue;
+          }
           uint32_t pattern_idx = pg_msg.msg.comp_m_task.pattern_idx;
 
           std::vector<AggValueT> agg_result;
@@ -1700,6 +1726,22 @@ namespace Peregrine
   }
 
   bool
+  send_heartbeat(const Worker &worker)
+  {
+    struct PeregrineMessage pg_completed_task_msg = {
+      .msg_type = MessageType::Heartbeat,
+      .msg      = {},
+    };
+
+    zmq::multipart_t multi_zmq_msg;
+    multi_zmq_msg.addstr("");
+
+    zmq::message_t zmq_msg(&pg_completed_task_msg, sizeof(pg_completed_task_msg));
+    multi_zmq_msg.add(std::move(zmq_msg));
+    return multi_zmq_msg.send(*worker.sock, 0);
+  }
+
+  bool
   send_task_complete_msg(zmq::socket_t &socket, struct Task *task, uint64_t count)
   {
     struct CompletedCountTask completed_task = {
@@ -1730,7 +1772,6 @@ namespace Peregrine
       const std::vector<SmallGraph> &patterns
   )
   {
-    utils::Log{} << "using single\n";
     // initialize
     std::vector<std::pair<SmallGraph, decltype(std::declval<VF>()(std::declval<AggValueT>()))>> results;
     if (patterns.empty()) return results;
@@ -1753,14 +1794,18 @@ namespace Peregrine
     uint64_t tasks_completed = 0;
     TaskIterator task_it(*dg, patterns);
     auto curr_task_it = task_it.begin();
-    size_t num_workers = master.worker_ids.size();
+    size_t num_workers = master.workers.size();
     while (tasks_completed < tasks_sent || !curr_task_it.end) {
         std::string worker_id;
         if (tasks_sent < num_workers * NUM_ACTIVE_TASKS_PER_WORKER && !curr_task_it.end) {
-          worker_id = master.worker_ids[tasks_sent % num_workers];
+          worker_id = master.workers[tasks_sent % num_workers].worker_id;
         } else {
           auto [pg_msg, data, msg_worker_id] = get_pg_msg_data_and_id(master);
           worker_id = msg_worker_id;
+          if (pg_msg.msg_type == MessageType::Heartbeat) {
+            update_liveness(master, worker_id);
+            continue;
+          }
           uint32_t pattern_idx = pg_msg.msg.comp_m_task.pattern_idx;
 
           Context::current_pattern = std::make_shared<AnalyzedPattern>(AnalyzedPattern(patterns[pattern_idx]));
@@ -1888,7 +1933,18 @@ namespace Peregrine
       auto working_t1 = utils::get_timestamp();
 
       barrier.release();
-      barrier.join();
+
+      std::packaged_task<void()> barrier_join_task([&]() { usleep(1000000); barrier.join(); });
+      std::future<void> barrier_join = barrier_join_task.get_future();
+      std::thread t(std::move(barrier_join_task));
+
+      std::future_status barrier_status;
+      barrier_status = barrier_join.wait_for(std::chrono::seconds(1));
+      while (barrier_status != std::future_status::ready) {
+        send_heartbeat(worker);
+        barrier_status = barrier_join.wait_for(std::chrono::seconds(1));
+      };
+      t.join();
 
       auto working_t2 = utils::get_timestamp();
 
@@ -1931,7 +1987,6 @@ namespace Peregrine
       const std::vector<SmallGraph> &patterns
   )
   {
-    utils::Log{} << "using multi\n";
     // initialize
     std::vector<std::pair<SmallGraph, decltype(std::declval<VF>()(std::declval<AggValueT>()))>> results;
     if (patterns.empty()) return results;
@@ -1950,14 +2005,18 @@ namespace Peregrine
     uint64_t tasks_completed = 0;
     TaskIterator task_it(*dg, patterns);
     auto curr_task_it = task_it.begin();
-    size_t num_workers = master.worker_ids.size();
+    size_t num_workers = master.workers.size();
     while (tasks_completed < tasks_sent || !curr_task_it.end) {
         std::string worker_id;
         if (tasks_sent < num_workers * NUM_ACTIVE_TASKS_PER_WORKER && !curr_task_it.end) {
-          worker_id = master.worker_ids[tasks_sent % num_workers];
+          worker_id = master.workers[tasks_sent % num_workers].worker_id;
         } else {
           auto [pg_msg, data, msg_worker_id] = get_pg_msg_data_and_id(master);
           worker_id = msg_worker_id;
+          if (pg_msg.msg_type == MessageType::Heartbeat) {
+            update_liveness(master, worker_id);
+            continue;
+          }
           uint32_t pattern_idx = pg_msg.msg.comp_m_task.pattern_idx;
 
           std::unordered_map<AggKeyT, AggValueT> agg_result;
@@ -2585,7 +2644,11 @@ namespace Peregrine
       const auto res = ready_msg.recv(*master.sock, 0);
       if (res) {
         std::string identity = ready_msg.popstr();
-        master.worker_ids.push_back(identity);
+        struct WorkerStatus worker_status = {
+          .worker_id = identity,
+          .last_seen = utils::get_timestamp(),
+        };
+        master.workers.push_back(worker_status);
         num_workers_ready++;
         utils::Log{} << "[" << num_workers_ready << "/" << nworkers << "] workers are ready" << "\n";
       }
