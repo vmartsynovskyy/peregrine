@@ -157,7 +157,7 @@ namespace Peregrine
     std::vector<WorkerStatus> workers;
   };
 
-  const uint64_t NUM_TASKS_PER_ITEM = 200;
+  const uint64_t NUM_TASKS_PER_ITEM = 1024;
   const uint32_t NUM_ACTIVE_TASKS_PER_WORKER = 10;
 
   const utils::timestamp_t HEARTBEAT_TIMEOUT = 10 * 1000000;
