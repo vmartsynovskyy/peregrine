@@ -157,8 +157,10 @@ namespace Peregrine
     std::vector<WorkerStatus> workers;
   };
 
-  const uint64_t NUM_TASKS_PER_ITEM = 1024;
+  const uint64_t NUM_TASKS_PER_ITEM = 50;
   const uint32_t NUM_ACTIVE_TASKS_PER_WORKER = 10;
+
+  const utils::timestamp_t HEARTBEAT_TIMEOUT = 10 * 1000000;
 
   class TaskIterator
   {
@@ -658,6 +660,38 @@ namespace Peregrine
     return pg_msg->msg.work_type_msg.work_type;
   }
 
+  void
+  update_liveness(Master &master, std::string worker_id)
+  {
+    auto worker = std::find_if(master.workers.begin(),
+        master.workers.end(),
+        [&worker_id](const WorkerStatus& x) { return x.worker_id == worker_id; });
+    if (worker != master.workers.end()) {
+      worker->last_seen = utils::get_timestamp();
+      utils::Log{} << "Updated liveness for worker with id " << worker->worker_id << " at time " << worker->last_seen / (1e-6) << "\n";
+    }
+  }
+
+  std::vector<std::string>
+  get_and_remove_dead_workers(Master &master)
+  {
+    std::vector<std::string> dead_workers;
+
+    auto worker_it = master.workers.begin();
+    while (worker_it != master.workers.end()) {
+      utils::timestamp_t time_since_seen = utils::get_timestamp() - worker_it->last_seen;
+      if (time_since_seen > HEARTBEAT_TIMEOUT) {
+        utils::Log{} << "Worker with ID" << worker_it->worker_id << " removed after " << time_since_seen / (1e-6) << "s \n";
+        dead_workers.push_back(worker_it->worker_id);
+        worker_it = master.workers.erase(worker_it);
+      } else {
+        ++worker_it;
+      }
+    }
+
+    return dead_workers;
+  }
+
   std::vector<std::pair<SmallGraph, uint64_t>>
   count_distributed(
       Master &master,
@@ -723,23 +757,59 @@ namespace Peregrine
     TaskIterator task_it(*dg, new_patterns);
     auto curr_task_it = task_it.begin();
     size_t num_workers = master.workers.size();
-    while (tasks_completed < tasks_sent || !curr_task_it.end) {
+
+    std::unordered_map<std::string, std::queue<struct Task>> worker_tasks;
+    for (auto &worker : master.workers) {
+      std::queue<struct Task> tasks;
+      worker_tasks.insert(std::pair(worker.worker_id, tasks));
+    }
+    std::queue<struct Task> unfinished_tasks;
+
+    while (tasks_completed < tasks_sent || !curr_task_it.end || !unfinished_tasks.empty()) {
         std::string worker_id;
         if (tasks_sent < num_workers * NUM_ACTIVE_TASKS_PER_WORKER  && !curr_task_it.end) {
           worker_id = master.workers[tasks_sent % num_workers].worker_id;
         } else {
           auto [pg_msg, data, msg_worker_id] = get_pg_msg_data_and_id(master);
           worker_id = msg_worker_id;
+          update_liveness(master, worker_id);
+
+          const auto& dead_workers = get_and_remove_dead_workers(master);
+          for (const auto &dead_worker_id : dead_workers) {
+            auto &dead_worker_tasks = worker_tasks[dead_worker_id];
+            // tasks assigned to a dead worker should be placed in the unfinished tasks queue
+            while (!dead_worker_tasks.empty()) {
+              unfinished_tasks.push(dead_worker_tasks.front());
+              dead_worker_tasks.pop();
+              tasks_sent--;
+            }
+
+            num_workers--;
+            worker_tasks.erase(dead_worker_id);
+          }
+
+          if (pg_msg.msg_type == MessageType::Heartbeat) {
+            continue;
+          }
+
           results_map[pg_msg.msg.comp_c_task.pattern_idx] += pg_msg.msg.comp_c_task.count;
           
+          worker_tasks[worker_id].pop();
           tasks_completed++;
         }
         
         if (!curr_task_it.end) {
           send_task_msg(*master.sock, worker_id, *curr_task_it);
 
+          worker_tasks[worker_id].push(*curr_task_it);
           ++curr_task_it;
           ++tasks_sent;
+        } else if (!unfinished_tasks.empty()) {
+          send_task_msg(*master.sock, worker_id, unfinished_tasks.front());
+          worker_tasks[worker_id].push(unfinished_tasks.front());
+
+          ++tasks_sent;
+          unfinished_tasks.pop();
         }
     }
 
@@ -1477,18 +1547,6 @@ namespace Peregrine
     return multi_zmq_msg.send(socket, 0);
   }
 
-  void
-  update_liveness(Master &master, std::string worker_id)
-  {
-    auto worker = std::find_if(master.workers.begin(),
-        master.workers.end(),
-        [&worker_id](const WorkerStatus& x) { return x.worker_id == worker_id; });
-    if (worker != master.workers.end()) {
-      worker->last_seen = utils::get_timestamp();
-      utils::Log{} << "Updated liveness for worker with id " << worker->worker_id << " at time " << worker->last_seen / (1e-6) << "\n";
-    }
-  }
-
   template <typename AggValueT, typename PF, typename VF>
   std::vector<std::pair<SmallGraph, decltype(std::declval<VF>()(std::declval<AggValueT>()))>>
   match_vector_distributed(
@@ -1528,15 +1586,37 @@ namespace Peregrine
     TaskIterator task_it(*dg, patterns);
     auto curr_task_it = task_it.begin();
     size_t num_workers = master.workers.size();
-    while (tasks_completed < tasks_sent || !curr_task_it.end) {
+
+    std::unordered_map<std::string, std::queue<struct Task>> worker_tasks;
+    for (auto &worker : master.workers) {
+      std::queue<struct Task> tasks;
+      worker_tasks.insert(std::pair(worker.worker_id, tasks));
+    }
+    std::queue<struct Task> unfinished_tasks;
+
+    while (tasks_completed < tasks_sent || !curr_task_it.end || !unfinished_tasks.empty()) {
         std::string worker_id;
         if (tasks_sent < num_workers * NUM_ACTIVE_TASKS_PER_WORKER && !curr_task_it.end) {
           worker_id = master.workers[tasks_sent % num_workers].worker_id;
         } else {
           auto [pg_msg, data, msg_worker_id] = get_pg_msg_data_and_id(master);
           worker_id = msg_worker_id;
+          update_liveness(master, worker_id);
+
+          const auto& dead_workers = get_and_remove_dead_workers(master);
+          for (const auto &dead_worker_id : dead_workers) {
+            auto &dead_worker_tasks = worker_tasks[dead_worker_id];
+            // tasks assigned to a dead worker should be placed in the unfinished tasks queue
+            while (!dead_worker_tasks.empty()) {
+              unfinished_tasks.push(dead_worker_tasks.front());
+              dead_worker_tasks.pop();
+            }
+
+            num_workers--;
+            worker_tasks.erase(dead_worker_id);
+          }
+
           if (pg_msg.msg_type == MessageType::Heartbeat) {
-            update_liveness(master, worker_id);
             continue;
           }
           uint32_t pattern_idx = pg_msg.msg.comp_m_task.pattern_idx;
@@ -1559,14 +1639,21 @@ namespace Peregrine
             pattern_results_map[i] += agg_result[i];
           }
 
+          worker_tasks[worker_id].pop();
           tasks_completed++;
         }
         
         if (!curr_task_it.end) {
           send_task_msg(*master.sock, worker_id, *curr_task_it);
 
+          worker_tasks[worker_id].push(*curr_task_it);
           ++curr_task_it;
           ++tasks_sent;
+        } else if (!unfinished_tasks.empty()) {
+          send_task_msg(*master.sock, worker_id, unfinished_tasks.front());
+          worker_tasks[worker_id].push(unfinished_tasks.front());
+
+          unfinished_tasks.pop();
         }
     }
 
@@ -2214,7 +2301,6 @@ namespace Peregrine
     return results;
   }
 
-
   void
   count_distributed_worker(struct Worker& worker, DataGraph &dg, const std::vector<SmallGraph> &patterns)
   {
@@ -2252,7 +2338,18 @@ namespace Peregrine
       auto working_t1 = utils::get_timestamp();
 
       barrier.release();
-      barrier.join();
+      std::packaged_task<void()> barrier_join_task([&]() { usleep(1000000); barrier.join(); });
+      std::future<void> barrier_join = barrier_join_task.get_future();
+      std::thread t(std::move(barrier_join_task));
+
+      std::future_status barrier_status;
+      barrier_status = barrier_join.wait_for(std::chrono::seconds(1));
+      while (barrier_status != std::future_status::ready) {
+        utils::Log{} << "sending heartbeat\n";
+        send_heartbeat(worker);
+        barrier_status = barrier_join.wait_for(std::chrono::seconds(1));
+      };
+      t.join();
 
       auto working_t2 = utils::get_timestamp();
 
