@@ -162,6 +162,8 @@ namespace Peregrine
 
   const utils::timestamp_t HEARTBEAT_TIMEOUT = 10 * 1000000;
   const auto HEARTBEAT_INTERVAL = std::chrono::milliseconds(1000);
+  
+  const int WORKER_READY_TIMEOUT_MS = 10 * 1000;
 
   class TaskIterator
   {
@@ -634,12 +636,15 @@ namespace Peregrine
     return std::tuple(*pg_msg, data_str, worker_id);
   }
 
-  std::pair<struct PeregrineMessage, std::string>
+  std::optional<std::pair<struct PeregrineMessage, std::string>>
   get_pg_msg_and_data(
       const Worker &worker
   )
   {
-    zmq::multipart_t multi_msg(*worker.sock);
+    zmq::multipart_t multi_msg;
+    if (!multi_msg.recv(*worker.sock)) {
+      return {};
+    }
     const auto &pg_zmq_msg = multi_msg.back();
     const PeregrineMessage *pg_msg = static_cast<const PeregrineMessage*>(pg_zmq_msg.data());
 
@@ -2036,7 +2041,7 @@ namespace Peregrine
     uint64_t worker_tasks_completed = 0;
     uint64_t tasks_sum = 0;
     for (;;) {
-      auto [task_pg_msg, data] = get_pg_msg_and_data(worker);
+      auto [task_pg_msg, data] = get_pg_msg_and_data(worker).value();
       if (task_pg_msg.msg_type == MessageType::JobDone) {
         break;
       }
@@ -2391,7 +2396,7 @@ namespace Peregrine
     auto t1 = utils::get_timestamp();
     uint64_t worker_tasks_completed = 0;
     for (;;) {
-      auto [task_pg_msg, data] = get_pg_msg_and_data(worker);
+      auto [task_pg_msg, data] = get_pg_msg_and_data(worker).value();
       if (task_pg_msg.msg_type == MessageType::JobDone) {
         break;
       }
@@ -2756,7 +2761,21 @@ namespace Peregrine
 
     std::vector<SmallGraph> patterns;
     for (;;) {
-      auto [pg_msg, data_str] = get_pg_msg_and_data(worker);
+      struct PeregrineMessage pg_msg{};
+      std::string data_str;
+
+      worker.sock->set(zmq::sockopt::rcvtimeo, WORKER_READY_TIMEOUT_MS);
+      for (;;) {
+        auto msg_opt = get_pg_msg_and_data(worker);
+        if (msg_opt.has_value()) {
+          std::tie(pg_msg, data_str) = msg_opt.value();
+          break;
+        }
+        send_pg_msg_to_master(worker, ready_msg);
+        utils::Log{} << "Worker is ready. Waiting for tasks from master...\n";
+      }
+      worker.sock->set(zmq::sockopt::rcvtimeo, -1);
+
       if (pg_msg.msg_type == MessageType::Patterns) {
         patterns = read_patterns(data_str);
       } else if (pg_msg.msg_type == MessageType::DataGraphPath) {
@@ -2767,12 +2786,13 @@ namespace Peregrine
           utils::Log{} << "Finished reading datagraph: |V| = " << dg->get_vertex_count()
                     << " |E| = " << dg->get_edge_count()
                     << "\n";
-          struct PeregrineMessage datagraph_done_msg = {
-            .msg_type = MessageType::DoneDatagraph,
-            .msg      = {},
-          };
-          send_pg_msg_to_master(worker, datagraph_done_msg);
         }
+        struct PeregrineMessage datagraph_done_msg = {
+          .msg_type = MessageType::DoneDatagraph,
+          .msg      = {},
+        };
+        send_pg_msg_to_master(worker, datagraph_done_msg);
+        last_datagraph_path = new_datagraph_path;
       } else if (pg_msg.msg_type == MessageType::WorkType) {
         PgWorkType work_type = pg_msg.msg.work_type_msg.work_type;
         if (work_type == PgWorkType::Count) {
@@ -2806,10 +2826,21 @@ namespace Peregrine
 
     uint32_t num_workers_ready = 0;
     utils::Log{} << "Waiting for all workers to become ready...\n";
-    while (num_workers_ready < nworkers) {
+    while (master.workers.size() < nworkers) {
       auto [pg_msg, data, worker_id] = get_pg_msg_data_and_id(master);
       if (pg_msg.msg_type != MessageType::Ready) {
         utils::Log{} << "WARN: got message type that wasn't Ready\n";
+        continue;
+      }
+
+      // don't count ready messages from the same worker
+      bool worker_exists = false;
+      for (auto &worker : master.workers) {
+        if (worker.worker_id == worker_id) {
+          worker_exists = true;
+        }
+      }
+      if (worker_exists) {
         continue;
       }
 
