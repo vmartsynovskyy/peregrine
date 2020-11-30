@@ -10,7 +10,7 @@ int main(int argc, char *argv[])
 {
   if (argc < 4)
   {
-    std::cerr << "USAGE: " << argv[0] << " <data graph> <max size> <support threshold> [# threads]" << std::endl;
+    std::cerr << "USAGE: " << argv[0] << " <data graph> <max size> <support threshold> [# workers]" << std::endl;
     return -1;
   }
 
@@ -19,7 +19,7 @@ int main(int argc, char *argv[])
   uint32_t k = std::stoi(argv[2]);
 
   uint64_t threshold = std::stoi(argv[3]);
-  size_t nworkers = argc < 5 ? std::thread::hardware_concurrency() : std::stoi(argv[4]);
+  size_t nworkers = argc < 5 ? 1 : std::stoi(argv[4]);
 
   const auto view = [](auto &&v) { return v.get_support(); };
 
